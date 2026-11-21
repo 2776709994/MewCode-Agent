@@ -25,7 +25,8 @@ public final class SpawnDispatcher {
             ToolRegistry registry,
             String protocol,
             com.mewcode.config.ProviderConfig providerConfig,
-            String workdir
+            String workdir,
+            com.mewcode.permission.PermissionMode permissionMode
     ) {}
 
     public record SpawnResult(
@@ -46,6 +47,7 @@ public final class SpawnDispatcher {
                 if (config.workdir() != null) {
                     member.agent.setWorkDir(config.workdir());
                 }
+                member.agent.setHeadlessMode(config.permissionMode());
                 member.active = true;
                 member.thread = Thread.startVirtualThread(() ->
                         TeammateRunner.runInProcessTeammate(team, member, config.task(), config.addendum()));

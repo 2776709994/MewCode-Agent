@@ -308,6 +308,10 @@ public class AskUserDialog {
     /**
      * Close the dialog with a cancellation marker.
      */
+    public void reset() {
+        cancelDialog();
+    }
+
     private Map<String, String> cancelDialog() {
         active = false;
         return Map.of("_declined", "true");

@@ -76,17 +76,19 @@ public class ReadFileTool implements Tool {
         int offset = intArg(args, "offset", 0);
         int limit = intArg(args, "limit", 2000);
 
+        if (offset < 0 || limit < 1) return ToolResult.error("Error: offset must be non-negative and limit must be positive");
         Path path = Path.of(filePath);
 
         if (!Files.exists(path)) {
             return ToolResult.error("Error: file not found: " + filePath);
         }
-        if (Files.isDirectory(path)) {
+        if (!Files.isRegularFile(path)) {
             return ToolResult.error("Error: not a file: " + filePath);
         }
 
         String content;
         try {
+            if (Files.size(path) > 8 * 1024 * 1024) return ToolResult.error("Error: file exceeds 8 MiB");
             content = Files.readString(path);
         } catch (IOException e) {
             return ToolResult.error("Error reading file: " + e.getMessage());
@@ -98,10 +100,7 @@ public class ReadFileTool implements Tool {
             return ToolResult.success("");
         }
 
-        int end = offset + limit;
-        if (end > lines.length) {
-            end = lines.length;
-        }
+        int end = (int) Math.min(lines.length, (long) offset + limit);
 
         // Record in file-state cache so EditFile/WriteFile know the file has been read
         if (fileStateCache != null) {

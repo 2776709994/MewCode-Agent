@@ -70,6 +70,7 @@ public class ExitWorktreeTool implements Tool {
 
         String action = String.valueOf(args.getOrDefault("action", "keep"));
         boolean discard = Boolean.TRUE.equals(args.get("discard_changes"));
+        if (!"keep".equals(action) && !"remove".equals(action)) return ToolResult.error("Invalid worktree action");
 
         String worktreePath = session.worktreePath();
         String originalCwd = session.originalCwd();
@@ -100,27 +101,21 @@ public class ExitWorktreeTool implements Tool {
             }
         }
 
-        // Clear session
-        WorktreeSessionStore.restoreSession(null);
         try {
-            WorktreeSessionStore.save(worktreeManager.getProjectRoot(), null);
-        } catch (Exception ignored) {}
-
-        if ("remove".equals(action)) {
-            try {
-                worktreeManager.remove(session.worktreeName());
-            } catch (Exception e) {
-                return ToolResult.error("Error removing worktree: " + e.getMessage());
+            if ("remove".equals(action)) {
+                worktreeManager.remove(worktreePath, session.worktreeBranch(), discard);
             }
-            return ToolResult.success(
-                    "Exited and removed worktree at %s. Session is now back in %s."
-                            .formatted(worktreePath, originalCwd)
-            );
+            WorktreeSessionStore.save(worktreeManager.getProjectRoot(), null);
+            WorktreeSessionStore.restoreSession(null);
+        } catch (Exception e) {
+            if (!java.nio.file.Files.isDirectory(java.nio.file.Path.of(worktreePath))) {
+                WorktreeSessionStore.restoreSession(null);
+            }
+            return ToolResult.error("Error exiting worktree: " + e.getMessage());
         }
 
-        return ToolResult.success(
-                "Exited worktree. Your work is preserved at %s. Session is now back in %s."
-                        .formatted(worktreePath, originalCwd)
-        );
+        String message = "remove".equals(action) ? "Exited and removed worktree at %s. Session is back in %s."
+                : "Exited worktree. Your work is preserved at %s. Session is back in %s.";
+        return ToolResult.success(message.formatted(worktreePath, originalCwd));
     }
 }

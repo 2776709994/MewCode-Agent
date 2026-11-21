@@ -55,7 +55,7 @@ public class SubAgentTaskManager {
 
     public synchronized void setRunning(String id, Thread thread) {
         TaskEntry t = tasks.get(id);
-        if (t != null) {
+        if (t != null && t.status == TaskStatus.PENDING) {
             t.status = TaskStatus.RUNNING;
             t.thread = thread;
         }
@@ -63,7 +63,7 @@ public class SubAgentTaskManager {
 
     public synchronized void setCompleted(String id, String output) {
         TaskEntry t = tasks.get(id);
-        if (t != null) {
+        if (t != null && t.status == TaskStatus.RUNNING) {
             t.status = TaskStatus.COMPLETED;
             t.output = output;
             notifications.add(new TaskNotification(id, t.name, TaskStatus.COMPLETED, output));
@@ -72,7 +72,7 @@ public class SubAgentTaskManager {
 
     public synchronized void setFailed(String id, String errMsg) {
         TaskEntry t = tasks.get(id);
-        if (t != null) {
+        if (t != null && t.status == TaskStatus.RUNNING) {
             t.status = TaskStatus.FAILED;
             t.error = errMsg;
             notifications.add(new TaskNotification(id, t.name, TaskStatus.FAILED, errMsg));
@@ -88,6 +88,10 @@ public class SubAgentTaskManager {
             }
             notifications.add(new TaskNotification(id, t.name, TaskStatus.CANCELLED, ""));
         }
+    }
+
+    public synchronized void cancelAll() {
+        for (String id : tasks.keySet()) cancelTask(id);
     }
 
     public synchronized List<TaskNotification> drainNotifications() {
@@ -137,57 +141,75 @@ public class SubAgentTaskManager {
             String prompt,
             com.mewcode.toolresult.ContentReplacementState parentState
     ) {
-        String taskId = createTask(spec.name() + ": " + truncate(prompt, 50));
+        var conv = new com.mewcode.conversation.ConversationManager();
+        conv.addUserMessage(prompt);
+        return spawnConfigured(client, ToolFilter.filterForAgent(registry, spec, true, false, false),
+                protocol, cfg, spec, prompt, parentState, conv, System.getProperty("user.dir"),
+                com.mewcode.permission.PermissionMode.DEFAULT, null);
+    }
 
-        Thread thread = Thread.startVirtualThread(() -> {
-            com.mewcode.tool.ToolRegistry subRegistry = ToolFilter.filterForAgent(registry, spec);
-            var subAgent = new com.mewcode.agent.Agent(client, subRegistry, protocol, cfg);
+    String spawnConfigured(com.mewcode.llm.LlmClient client, com.mewcode.tool.ToolRegistry registry,
+                           String protocol, com.mewcode.config.ProviderConfig cfg, SubAgentSpec spec,
+                           String prompt, com.mewcode.toolresult.ContentReplacementState parentState,
+                           com.mewcode.conversation.ConversationManager conv, String workDir,
+                           com.mewcode.permission.PermissionMode mode, com.mewcode.worktree.AgentWorktree.Result worktree) {
+        String taskId = createTask(spec.name() + ": " + truncate(prompt, 50));
+        var inheritedState = parentState == null ? null : parentState.copy();
+
+        Thread thread = Thread.ofVirtual().unstarted(() -> {
+            var subAgent = new com.mewcode.agent.Agent(client, registry, protocol, cfg);
+            subAgent.setWorkDir(workDir);
+            subAgent.setHeadlessMode(mode);
             int maxTurns = spec.maxTurns() > 0 ? spec.maxTurns() : 200;
             subAgent.setMaxIterations(maxTurns);
-            if (parentState != null) {
-                subAgent.setReplacementState(parentState.copy());
+            if (inheritedState != null) {
+                subAgent.setReplacementState(inheritedState);
             }
 
-            var conv = new com.mewcode.conversation.ConversationManager();
             if (spec.systemPromptOverride() != null && !spec.systemPromptOverride().isEmpty()) {
                 conv.addSystemReminder(spec.systemPromptOverride());
             }
-            conv.addUserMessage(prompt);
 
             var output = new StringBuilder();
             BlockingQueue<AgentEvent> queue = subAgent.run(conv);
 
-            while (!Thread.currentThread().isInterrupted()) {
-                AgentEvent event;
-                try {
-                    event = queue.poll(60, TimeUnit.SECONDS);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    setFailed(taskId, "Interrupted");
-                    return;
-                }
-                if (event == null) {
-                    setFailed(taskId, "Timeout");
-                    return;
-                }
+            try {
+                while (!Thread.currentThread().isInterrupted()) {
+                    AgentEvent event;
+                    try {
+                        event = queue.poll(60, TimeUnit.SECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        setFailed(taskId, "Interrupted");
+                        return;
+                    }
+                    if (event == null) {
+                        setFailed(taskId, "Timeout");
+                        return;
+                    }
 
-                switch (event) {
-                    case AgentEvent.StreamText st -> output.append(st.text());
-                    case AgentEvent.ErrorEvent err -> {
-                        setFailed(taskId, err.message());
-                        return;
+                    switch (event) {
+                        case AgentEvent.StreamText st -> output.append(st.text());
+                        case AgentEvent.ErrorEvent err -> {
+                            setFailed(taskId, err.message());
+                            return;
+                        }
+                        case AgentEvent.LoopComplete lc -> {
+                            String result = output.isEmpty() ? "(agent produced no output)" : output.toString();
+                            if (worktree != null) result += "\n\nWorktree: " + worktree.worktreePath();
+                            setCompleted(taskId, result);
+                            return;
+                        }
+                        default -> {}
                     }
-                    case AgentEvent.LoopComplete lc -> {
-                        setCompleted(taskId, output.toString().isEmpty()
-                                ? "(agent produced no output)" : output.toString());
-                        return;
-                    }
-                    default -> {}
                 }
+            } finally {
+                com.mewcode.EventQueue.cancel(queue);
             }
         });
 
         setRunning(taskId, thread);
+        thread.start();
         return taskId;
     }
 

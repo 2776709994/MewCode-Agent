@@ -13,15 +13,19 @@ import com.mewcode.tool.Tool;
 import com.mewcode.tool.ToolCategory;
 import com.mewcode.tool.ToolRegistry;
 import com.mewcode.tool.ToolResult;
+import com.mewcode.tool.impl.BashTool;
 
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Set;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
@@ -37,77 +41,102 @@ public class StreamingExecutor {
     private final HookEngine hookEngine;
     private final BlockingQueue<AgentEvent> eventQueue;
     private final RecoveryState recoveryState;
+    private final Path workDir;
+    private final boolean interactive;
+    private final Set<String> availableTools;
 
     public record ToolCallInfo(String toolId, String toolName, Map<String, Object> args) {}
     public record ToolExecResult(String toolId, String output, boolean isError) {}
 
     public StreamingExecutor(ToolRegistry registry, PermissionChecker checker,
-                             HookEngine hookEngine, BlockingQueue<AgentEvent> eventQueue) {
-        this(registry, checker, hookEngine, eventQueue, null);
-    }
-
-    public StreamingExecutor(ToolRegistry registry, PermissionChecker checker,
                              HookEngine hookEngine, BlockingQueue<AgentEvent> eventQueue,
-                             RecoveryState recoveryState) {
+                             RecoveryState recoveryState, Path workDir,
+                             boolean interactive, Set<String> availableTools) {
         this.registry = registry;
         this.checker = checker;
         this.hookEngine = hookEngine;
         this.eventQueue = eventQueue;
         this.recoveryState = recoveryState;
+        this.workDir = workDir;
+        this.interactive = interactive;
+        this.availableTools = availableTools;
     }
 
     public List<ToolExecResult> executeAll(List<ToolCallInfo> calls) {
-        var readCalls = new ArrayList<ToolCallInfo>();
-        var otherCalls = new ArrayList<ToolCallInfo>();
-        for (var call : calls) {
-            var tool = registry.get(call.toolName());
-            if (tool != null && tool.category() == ToolCategory.READ) {
-                readCalls.add(call);
-            } else {
-                otherCalls.add(call);
+        var results = new ArrayList<ToolExecResult>(calls.size());
+        boolean executionDirectoryChanged = false;
+        for (int i = 0; i < calls.size();) {
+            if (Thread.currentThread().isInterrupted()) {
+                results.add(fail(calls.get(i++), "Tool execution interrupted"));
+                continue;
             }
-        }
-
-        var results = new ArrayList<ToolExecResult>();
-
-        if (readCalls.size() > 1) {
+            int end = i;
+            while (!executionDirectoryChanged && end < calls.size() && isParallelRead(calls.get(end))) end++;
+            if (end - i < 2) {
+                var call = calls.get(i++);
+                var outcome = executionDirectoryChanged ? fail(call, "Worktree changed. Reissue this call in the next turn.")
+                        : executeSingle(call);
+                if (!outcome.isError() && ("EnterWorktree".equals(call.toolName()) || "ExitWorktree".equals(call.toolName()))) {
+                    executionDirectoryChanged = true;
+                }
+                results.add(outcome);
+                continue;
+            }
+            var batch = calls.subList(i, end);
             try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
-                var futures = readCalls.stream()
+                var futures = batch.stream()
                         .map(call -> executor.submit(() -> executeSingle(call)))
                         .toList();
-                for (var future : futures) {
-                    try { results.add(future.get()); }
-                    catch (Exception ignored) {}
+                for (int j = 0; j < batch.size(); j++) {
+                    try {
+                        results.add(futures.get(j).get());
+                    } catch (ExecutionException e) {
+                        results.add(fail(batch.get(j), "Tool execution failed: " + e.getCause().getMessage()));
+                    } catch (InterruptedException e) {
+                        futures.forEach(future -> future.cancel(true));
+                        Thread.currentThread().interrupt();
+                        for (; j < batch.size(); j++) {
+                            results.add(fail(batch.get(j), "Tool execution interrupted"));
+                        }
+                    }
                 }
             }
-        } else {
-            for (var call : readCalls) results.add(executeSingle(call));
+            i = end;
         }
-
-        for (var call : otherCalls) results.add(executeSingle(call));
-
         return results;
     }
 
-    private ToolExecResult executeSingle(ToolCallInfo call) {
+    private boolean isParallelRead(ToolCallInfo call) {
         Tool tool = registry.get(call.toolName());
-        if (tool == null) {
-            putSafe(new AgentEvent.ToolResultEvent(call.toolId(), call.toolName(), "Unknown tool", true, 0));
-            return new ToolExecResult(call.toolId(), "Error: unknown tool '" + call.toolName() + "'", true);
-        }
+        return tool != null && tool.category() == ToolCategory.READ
+                && !"AskUserQuestion".equals(call.toolName())
+                && !"ToolSearch".equals(call.toolName())
+                && !"ExitPlanMode".equals(call.toolName())
+                && (checker == null || checker.check(tool, call.args(), workDir).decision()
+                    != com.mewcode.permission.PermissionMode.Decision.ASK);
+    }
 
-        // Pre-tool hooks can reject execution
-        if (hookEngine != null) {
-            var hookResult = hookEngine.runPreToolHooks(call.toolName(), call.args());
-            if (hookResult.rejected()) {
-                String msg = "Rejected by hook: " + hookResult.message();
-                putSafe(new AgentEvent.ToolResultEvent(call.toolId(), call.toolName(), msg, true, 0));
-                return new ToolExecResult(call.toolId(), msg, true);
-            }
+    private ToolExecResult fail(ToolCallInfo call, String message) {
+        putSafe(new AgentEvent.ToolResultEvent(call.toolId(), call.toolName(), message, true, 0));
+        return new ToolExecResult(call.toolId(), message, true);
+    }
+
+    private ToolExecResult executeSingle(ToolCallInfo call) {
+        try {
+            return executeChecked(call);
+        } catch (RuntimeException e) {
+            return fail(call, "Tool execution error: " + e.getMessage());
+        }
+    }
+
+    private ToolExecResult executeChecked(ToolCallInfo call) {
+        Tool tool = registry.get(call.toolName());
+        if (tool == null || !availableTools.contains(call.toolName())) {
+            return fail(call, "Tool is unavailable: " + call.toolName());
         }
 
         if (checker != null) {
-            var check = checker.check(tool, call.args());
+            var check = checker.check(tool, call.args(), workDir);
             switch (check.decision()) {
                 case DENY -> {
                     String msg = "Permission denied: " + check.reason();
@@ -115,16 +144,20 @@ public class StreamingExecutor {
                     return new ToolExecResult(call.toolId(), msg, true);
                 }
                 case ASK -> {
+                    if (!interactive) return fail(call, "Tool requires interactive permission");
                     var future = new CompletableFuture<PermissionResponse>();
                     String desc = checker.describeToolAction(call.toolName(), call.args());
                     putSafe(new AgentEvent.PermissionRequestEvent(call.toolName(), desc, future));
                     PermissionResponse response;
                     try {
                         response = future.get(5, TimeUnit.MINUTES);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        response = PermissionResponse.DENY;
                     } catch (Exception e) {
                         response = PermissionResponse.DENY;
                     }
-                    if (response == PermissionResponse.DENY) {
+                    if (response == null || response == PermissionResponse.DENY) {
                         putSafe(new AgentEvent.ToolResultEvent(
                                 call.toolId(), call.toolName(), "Permission denied by user", true, 0));
                         return new ToolExecResult(call.toolId(), "User denied permission", true);
@@ -140,16 +173,22 @@ public class StreamingExecutor {
             }
         }
 
+        if (hookEngine != null) {
+            var hookResult = hookEngine.runPreToolHooks(call.toolName(), call.args());
+            if (hookResult.rejected()) return fail(call, "Rejected by hook: " + hookResult.message());
+        }
+
+        Map<String, Object> resolvedArgs = resolvePaths(call);
         long start = System.nanoTime();
         ToolResult result;
         try {
-            result = tool.execute(call.args());
+            result = tool instanceof BashTool bash ? bash.execute(resolvedArgs, workDir) : tool.execute(resolvedArgs);
         } catch (Exception e) {
             result = ToolResult.error("Tool execution error: " + e.getMessage());
         }
         double elapsed = (System.nanoTime() - start) / 1_000_000_000.0;
 
-        snapshotForRecovery(call, result);
+        snapshotForRecovery(call.toolName(), resolvedArgs, result);
 
         String output = result.output();
         if (output.length() > ToolRegistry.MAX_OUTPUT_CHARS) {
@@ -165,7 +204,7 @@ public class StreamingExecutor {
             hookEngine.runHooks(ctx);
         }
 
-        return new ToolExecResult(call.toolId(), output, result.isError());
+        return new ToolExecResult(call.toolId(), result.output(), result.isError());
     }
 
     private void putSafe(AgentEvent event) {
@@ -182,20 +221,40 @@ public class StreamingExecutor {
      * Re-reads from disk to keep the snapshot independent of how the tool
      * formats its output (e.g. line-number prefixes).
      */
-    private void snapshotForRecovery(ToolCallInfo call, ToolResult result) {
+    private void snapshotForRecovery(String toolName, Map<String, Object> args, ToolResult result) {
         if (recoveryState == null || result.isError()) return;
-        if (!"ReadFile".equals(call.toolName())) return;
-        Object pathObj = call.args() == null ? null : call.args().get("file_path");
+        if (!"ReadFile".equals(toolName)) return;
+        Object pathObj = args.get("file_path");
         if (!(pathObj instanceof String) || ((String) pathObj).isEmpty()) return;
         String path = (String) pathObj;
         try {
-            String content = Files.readString(Path.of(path));
-            recoveryState.recordFileRead(path, content);
+            try (var reader = Files.newBufferedReader(Path.of(path))) {
+                char[] buffer = new char[ToolRegistry.MAX_OUTPUT_CHARS];
+                int count = Math.max(0, reader.read(buffer));
+                recoveryState.recordFileRead(path, new String(buffer, 0, count));
+            }
         } catch (IOException ignored) {
             // Best-effort snapshot; if the file vanished between the tool
             // call and now, just skip — the model has the tool output it
             // already saw.
         }
+    }
+
+    private Map<String, Object> resolvePaths(ToolCallInfo call) {
+        String key = switch (call.toolName()) {
+            case "ReadFile", "WriteFile", "EditFile" -> "file_path";
+            case "Glob", "Grep" -> "path";
+            default -> null;
+        };
+        if (key == null) return call.args();
+        var args = new HashMap<>(call.args());
+        Object value = args.get(key);
+        if (value instanceof String path && !path.isBlank()) {
+            args.put(key, workDir.resolve(path).toAbsolutePath().normalize().toString());
+        } else if ("path".equals(key)) {
+            args.put(key, workDir.toString());
+        }
+        return args;
     }
 
     private static String extractContent(String toolName, Map<String, Object> args) {

@@ -70,13 +70,11 @@ public class WriteFileTool implements Tool {
     @Override
     public ToolResult execute(Map<String, Object> args) {
         String filePath = stringArg(args, "file_path", "");
-        String content = stringArg(args, "content", "");
+        if (!(args.get("content") instanceof String content)) return ToolResult.error("Error: content is required");
 
         if (filePath.isEmpty()) {
             return ToolResult.error("Error: file_path is required");
         }
-
-        if (fileHistory != null) fileHistory.trackEdit(filePath);
 
         Path path = Path.of(filePath);
 
@@ -104,11 +102,8 @@ public class WriteFileTool implements Tool {
         }
 
         try {
+            if (fileHistory != null) fileHistory.trackEdit(filePath);
             Files.writeString(path, content);
-            if (posix) {
-                Set<PosixFilePermission> filePerms = PosixFilePermissions.fromString("rw-r--r--");
-                Files.setPosixFilePermissions(path, filePerms);
-            }
         } catch (IOException e) {
             return ToolResult.error("Error writing file: " + e.getMessage());
         }

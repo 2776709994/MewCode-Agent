@@ -33,6 +33,7 @@ public class McpManager {
 
     private final Map<String, McpServerConfig> configs = new LinkedHashMap<>();
     private final Map<String, McpSyncClient> clients = new LinkedHashMap<>();
+    private volatile boolean closed;
 
     public McpManager(List<McpServerConfig> configs) {
         if (configs != null) {
@@ -44,27 +45,49 @@ public class McpManager {
         var tools = new ArrayList<Tool>();
         var servers = new ArrayList<ServerInfo>();
         var errors = new ArrayList<String>();
+        var registeredNames = new HashSet<String>();
 
         for (var entry : configs.entrySet()) {
             String name = entry.getKey();
             var cfg = entry.getValue();
 
+            if (closed) break;
+            McpSyncClient client = null;
             try {
-                var client = createClient(cfg);
+                client = createClient(cfg);
                 client.initialize();
-                clients.put(name, client);
-
                 String instructions = client.getServerInstructions();
+                var serverTools = new ArrayList<Tool>();
+                var cursors = new HashSet<String>();
+                String cursor = null;
+                do {
+                    var result = cursor == null ? client.listTools() : client.listTools(cursor);
+                    if (result == null) break;
+                    if (result.tools() != null) {
+                        for (var sdkTool : result.tools()) serverTools.add(new McpToolWrapper(name, sdkTool, client));
+                    }
+                    cursor = result.nextCursor();
+                    if (cursor != null && !cursors.add(cursor)) {
+                        throw new IllegalStateException("Server returned a repeated tool cursor");
+                    }
+                } while (cursor != null && !cursor.isBlank() && !closed);
+                synchronized (clients) {
+                    if (closed || clients.containsKey(name)) continue;
+                    clients.put(name, client);
+                }
+                client = null;
                 servers.add(new ServerInfo(name, instructions != null ? instructions : ""));
-
-                var result = client.listTools();
-                if (result != null && result.tools() != null) {
-                    for (var sdkTool : result.tools()) {
-                        tools.add(new McpToolWrapper(name, sdkTool, client));
+                for (Tool tool : serverTools) {
+                    if (registeredNames.add(tool.name())) {
+                        tools.add(tool);
+                    } else {
+                        errors.add("Duplicate MCP tool name: " + tool.name());
                     }
                 }
             } catch (Exception e) {
                 errors.add("MCP server '" + name + "': " + e.getMessage());
+            } finally {
+                if (client != null) closeClient(client);
             }
         }
 
@@ -78,10 +101,17 @@ public class McpManager {
     }
 
     public void shutdown() {
-        for (var client : clients.values()) {
-            try { client.closeGracefully(); } catch (Exception ignored) {}
+        List<McpSyncClient> toClose;
+        synchronized (clients) {
+            closed = true;
+            toClose = List.copyOf(clients.values());
+            clients.clear();
         }
-        clients.clear();
+        toClose.forEach(McpManager::closeClient);
+    }
+
+    private static void closeClient(McpSyncClient client) {
+        try { client.close(); } catch (Exception ignored) {}
     }
 
     private McpSyncClient createClient(McpServerConfig cfg) {
@@ -130,7 +160,7 @@ public class McpManager {
         return command;
     }
 
-    static String sanitizeName(String name) {
+    public static String sanitizeName(String name) {
         return NON_ALNUM.matcher(name).replaceAll("_");
     }
 
@@ -138,7 +168,7 @@ public class McpManager {
         if (value == null) return null;
         return ENV_VAR.matcher(value).replaceAll(m -> {
             String env = System.getenv(m.group(1));
-            return env != null ? env : m.group(0);
+            return java.util.regex.Matcher.quoteReplacement(env != null ? env : m.group(0));
         });
     }
 
@@ -156,7 +186,10 @@ public class McpManager {
         }
 
         @Override public String name() {
-            return "mcp__" + sanitizeName(serverName) + "__" + sanitizeName(sdkTool.name());
+            String fullName = "mcp__" + sanitizeName(serverName) + "__" + sanitizeName(sdkTool.name());
+            if (fullName.length() <= 64) return fullName;
+            return fullName.substring(0, 27) + "-"
+                    + UUID.nameUUIDFromBytes(fullName.getBytes(java.nio.charset.StandardCharsets.UTF_8));
         }
 
         @Override public String description() {
@@ -173,6 +206,7 @@ public class McpManager {
                 if (jsonSchema.type() != null) input.put("type", jsonSchema.type());
                 if (jsonSchema.properties() != null) input.put("properties", jsonSchema.properties());
                 if (jsonSchema.required() != null) input.put("required", jsonSchema.required());
+                if (jsonSchema.additionalProperties() != null) input.put("additionalProperties", jsonSchema.additionalProperties());
             }
             if (input.isEmpty()) {
                 input.put("type", "object");

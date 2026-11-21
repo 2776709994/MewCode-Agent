@@ -6,7 +6,6 @@
 package com.mewcode.worktree;
 
 import java.nio.file.Path;
-import java.util.concurrent.TimeUnit;
 
 /**
  * Change detection for worktrees with fail-closed semantics.
@@ -75,16 +74,11 @@ public final class WorktreeChanges {
             pb.directory(Path.of(cwd).toFile());
             pb.environment().put("GIT_TERMINAL_PROMPT", "0");
             pb.environment().put("GIT_ASKPASS", "");
-            pb.redirectErrorStream(false);
-
-            Process proc = pb.start();
-            String stdout = new String(proc.getInputStream().readAllBytes());
-            boolean finished = proc.waitFor(30, TimeUnit.SECONDS);
-            if (!finished) {
-                proc.destroyForcibly();
-                return null;
-            }
-            return proc.exitValue() == 0 ? stdout : null;
+            var result = com.mewcode.ProcessExecution.capture(pb, java.time.Duration.ofSeconds(30));
+            return result.exitCode() == 0 ? result.output() : null;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return null;
         } catch (Exception e) {
             return null;
         }

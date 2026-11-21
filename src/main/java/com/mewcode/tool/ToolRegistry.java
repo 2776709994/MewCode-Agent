@@ -23,7 +23,7 @@ public class ToolRegistry {
     }
 
     public List<String> getDeferredToolNames() {
-        return tools.values().stream()
+        return orderedTools().stream()
                 .filter(t -> t.shouldDefer() && !discoveredTools.contains(t.name()))
                 .map(Tool::name)
                 .toList();
@@ -33,17 +33,21 @@ public class ToolRegistry {
         tools.put(tool.name(), tool);
     }
 
+    private List<Tool> orderedTools() {
+        return tools.values().stream().sorted(Comparator.comparing(Tool::name)).toList();
+    }
+
     public Tool get(String name) {
-        return tools.get(name);
+        return name == null ? null : tools.get(name);
     }
 
     public List<Tool> listTools() {
-        return List.copyOf(tools.values());
+        return orderedTools();
     }
 
     public List<Map<String, Object>> getAllSchemas(String protocol) {
         var schemas = new ArrayList<Map<String, Object>>();
-        for (var tool : tools.values()) {
+        for (var tool : orderedTools()) {
             if (tool.shouldDefer() && !discoveredTools.contains(tool.name())) continue;
             var base = tool.schema();
             if ("openai".equals(protocol)) {
@@ -61,18 +65,18 @@ public class ToolRegistry {
     }
 
     public List<Tool> getDeferredTools() {
-        return tools.values().stream()
+        return orderedTools().stream()
                 .filter(Tool::shouldDefer)
                 .toList();
     }
 
     public List<Map<String, Object>> searchDeferred(String query, int maxResults, String protocol) {
-        String lower = query.toLowerCase();
+        String lower = query.toLowerCase(Locale.ROOT);
         var matches = new ArrayList<Map<String, Object>>();
-        for (var tool : tools.values()) {
+        for (var tool : orderedTools()) {
             if (!tool.shouldDefer()) continue;
-            if (tool.name().toLowerCase().contains(lower)
-                    || tool.description().toLowerCase().contains(lower)) {
+            if (tool.name().toLowerCase(Locale.ROOT).contains(lower)
+                    || tool.description().toLowerCase(Locale.ROOT).contains(lower)) {
                 var base = tool.schema();
                 if ("openai".equals(protocol)) {
                     matches.add(Map.of(
@@ -92,11 +96,11 @@ public class ToolRegistry {
 
     public List<Map<String, Object>> findDeferredByNames(List<String> names, String protocol) {
         var nameSet = new HashSet<String>();
-        for (var n : names) nameSet.add(n.toLowerCase());
+        for (var n : names) nameSet.add(n.toLowerCase(Locale.ROOT));
 
         var matches = new ArrayList<Map<String, Object>>();
-        for (var tool : tools.values()) {
-            if (nameSet.contains(tool.name().toLowerCase())) {
+        for (var tool : orderedTools()) {
+            if (tool.shouldDefer() && nameSet.contains(tool.name().toLowerCase(Locale.ROOT))) {
                 var base = tool.schema();
                 if ("openai".equals(protocol)) {
                     matches.add(Map.of(

@@ -41,7 +41,8 @@ public class MewCode {
         var model = new MewCodeModel(
                 config.getProviders(),
                 config.getMcpServers() != null ? config.getMcpServers() : List.of(),
-                config.getHooks() != null ? config.getHooks() : List.of()
+                config.getHooks() != null ? config.getHooks() : List.of(),
+                com.mewcode.permission.PermissionMode.fromConfig(config.getPermissionMode())
         );
 
         var program = new Program(model);
@@ -62,6 +63,7 @@ public class MewCode {
         try {
             program.run();
         } finally {
+            model.shutdown();
             System.out.print("\033[?25h");
             System.out.flush();
         }

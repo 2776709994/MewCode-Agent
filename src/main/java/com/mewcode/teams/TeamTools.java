@@ -25,10 +25,16 @@ public final class TeamTools {
     public static class SendMessageTool implements Tool {
         private final TeamManager teamMgr;
         private final String senderName;
+        private final String teamName;
 
         public SendMessageTool(TeamManager teamMgr, String senderName) {
+            this(teamMgr, senderName, null);
+        }
+
+        public SendMessageTool(TeamManager teamMgr, String senderName, String teamName) {
             this.teamMgr = teamMgr;
             this.senderName = senderName;
+            this.teamName = teamName;
         }
 
         @Override public String name() { return "SendMessage"; }
@@ -43,6 +49,7 @@ public final class TeamTools {
         @Override
         public Map<String, Object> schema() {
             var props = new LinkedHashMap<String, Object>();
+            props.put("team_name", Map.of("type", "string", "description", "Team name when the recipient is ambiguous"));
             props.put("to", Map.of("type", "string", "description", "Name of the recipient agent"));
             props.put("content", Map.of("type", "string", "description", "Message content to send"));
 
@@ -65,34 +72,23 @@ public final class TeamTools {
                 return ToolResult.error("Error: 'to' and 'content' are required");
             }
 
-            // Route to lead by finding any team the sender belongs to.
-            if ("lead".equals(to)) {
-                for (String teamName : teamMgr.listTeams()) {
-                    TeamManager.Team team = teamMgr.getTeam(teamName);
-                    if (team != null && team.hasMember(senderName)) {
-                        team.sendMessage(senderName, "lead", content);
-                        return ToolResult.success("Message sent to lead.");
-                    }
-                }
-                return ToolResult.error("Error: cannot find team for sender '" + senderName + "'");
-            }
+            if (!TeamManager.isValidName(to)) return ToolResult.error("Invalid recipient name");
 
-            for (String teamName : teamMgr.listTeams()) {
-                TeamManager.Team team = teamMgr.getTeam(teamName);
-                if (team == null) continue;
-                if (team.hasMember(to)) {
-                    team.sendMessage(senderName, to, content);
-                    return ToolResult.success("Message sent to " + to + ".");
-                }
-                // Fallback: sender belongs to this team but recipient not in Members
-                // (tmux mode — each process only knows itself). Write to mailbox directly.
-                if (team.hasMember(senderName)) {
-                    team.sendMessage(senderName, to, content);
-                    return ToolResult.success("Message sent to " + to + ".");
-                }
+            String requestedTeam = teamName != null ? teamName
+                    : args.get("team_name") instanceof String name ? name : null;
+            var candidates = requestedTeam == null ? teamMgr.listTeams() : List.of(requestedTeam);
+            TeamManager.Team destination = null;
+            for (String candidate : candidates) {
+                var team = teamMgr.getTeam(candidate);
+                if (team == null || !("lead".equals(senderName) || team.hasMember(senderName))) continue;
+                if (!("lead".equals(to) || team.hasMember(to))) continue;
+                if (destination != null) return ToolResult.error("Recipient is ambiguous. Specify team_name.");
+                destination = team;
             }
-
-            return ToolResult.error("Error: recipient '" + to + "' not found in any team");
+            if (destination == null) return ToolResult.error("Recipient not found in the selected team: " + to);
+            return destination.sendMessage(senderName, to, content)
+                    ? ToolResult.success("Message sent to " + to + ".")
+                    : ToolResult.error("Could not write the recipient mailbox");
         }
     }
 
@@ -168,10 +164,7 @@ public final class TeamTools {
                 return ToolResult.error("Error: team_name is required");
             }
 
-            String baseName = name;
-            for (int i = 2; teamMgr.getTeam(name) != null; i++) {
-                name = baseName + "-" + i;
-            }
+            if (!TeamManager.isValidName(name)) return ToolResult.error("Invalid team name");
 
             TeamManager.TeamMode mode = TeamManager.detectBackend();
             TeamManager.Team team = teamMgr.createTeam(name, mode);

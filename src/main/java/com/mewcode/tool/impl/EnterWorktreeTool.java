@@ -80,10 +80,10 @@ public class EnterWorktreeTool implements Tool {
                     info.path(),
                     slug,
                     info.branch(),
-                    "", "", sessionId, 0
+                    "", worktreeManager.readHead(info.path()), sessionId, 0
             );
-            WorktreeSessionStore.restoreSession(session);
             WorktreeSessionStore.save(worktreeManager.getProjectRoot(), session);
+            WorktreeSessionStore.restoreSession(session);
 
             return ToolResult.success(
                     "Created worktree at %s on branch %s. The session is now working in the worktree. Use ExitWorktree to leave mid-session."

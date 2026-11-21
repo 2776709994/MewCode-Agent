@@ -7,6 +7,7 @@ package com.mewcode.llm;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mewcode.config.ProviderConfig;
+import com.mewcode.EventQueue;
 import com.mewcode.conversation.ConversationManager;
 import com.mewcode.conversation.Message;
 import com.openai.client.okhttp.OpenAIOkHttpClient;
@@ -18,7 +19,6 @@ import com.openai.models.responses.*;
 
 import java.util.*;
 import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.LinkedBlockingQueue;
 
 public class OpenAiClient implements LlmClient {
 
@@ -53,9 +53,9 @@ public class OpenAiClient implements LlmClient {
 
     @Override
     public BlockingQueue<StreamEvent> stream(ConversationManager conv, List<Map<String, Object>> tools) {
-        var queue = new LinkedBlockingQueue<StreamEvent>(64);
+        var queue = new EventQueue<StreamEvent>();
 
-        Thread.startVirtualThread(() -> {
+        queue.start(() -> {
             try {
                 doStream(conv, tools, queue);
             } catch (InterruptedException e) {
@@ -74,6 +74,7 @@ public class OpenAiClient implements LlmClient {
 
         var paramsBuilder = ResponseCreateParams.builder()
                 .model(model)
+                .maxOutputTokens(maxOutputTokens)
                 .instructions(systemPrompt)
                 .inputOfResponse(buildInput(conv.getMessages()));
 
@@ -90,12 +91,6 @@ public class OpenAiClient implements LlmClient {
             }
         }
 
-        String currentToolName = "";
-        String currentCallId = "";
-        var jsonAccum = new StringBuilder();
-        var reasoningText = new StringBuilder();
-        String reasoningId = "";
-
         try (StreamResponse<ResponseStreamEvent> streamResponse =
                      sdkClient.responses().createStreaming(paramsBuilder.build())) {
 
@@ -109,53 +104,50 @@ public class OpenAiClient implements LlmClient {
                     var item = event.asOutputItemAdded().item();
                     if (item.isFunctionCall()) {
                         var fc = item.asFunctionCall();
-                        currentToolName = fc.name();
-                        currentCallId = fc.callId();
-                        jsonAccum.setLength(0);
-                        queue.put(new StreamEvent.ToolCallStart(currentCallId, currentToolName));
-                    } else if (item.isReasoning()) {
-                        reasoningId = item.asReasoning().id();
-                        reasoningText.setLength(0);
+                        queue.put(new StreamEvent.ToolCallStart(fc.callId(), fc.name()));
                     }
                 } else if (event.isFunctionCallArgumentsDelta()) {
-                    String delta = event.asFunctionCallArgumentsDelta().delta();
-                    jsonAccum.append(delta);
-                    queue.put(new StreamEvent.ToolCallDelta(delta));
-                } else if (event.isFunctionCallArgumentsDone()) {
-                    Map<String, Object> args;
-                    try {
-                        @SuppressWarnings("unchecked")
-                        var parsed = MAPPER.readValue(jsonAccum.toString(), Map.class);
-                        args = parsed;
-                    } catch (Exception ex) {
-                        args = Map.of();
-                    }
-                    queue.put(new StreamEvent.ToolCallComplete(currentCallId, currentToolName, args));
-                    currentToolName = "";
-                    currentCallId = "";
-                    jsonAccum.setLength(0);
+                    queue.put(new StreamEvent.ToolCallDelta(event.asFunctionCallArgumentsDelta().delta()));
                 } else if (event.isReasoningSummaryTextDelta()) {
-                    String delta = event.asReasoningSummaryTextDelta().delta();
-                    reasoningText.append(delta);
-                    queue.put(new StreamEvent.ThinkingDelta(delta));
-                } else if (event.isReasoningSummaryTextDone()) {
-                    queue.put(new StreamEvent.ThinkingComplete(reasoningText.toString(), reasoningId));
-                } else if (event.isCompleted()) {
-                    var resp = event.asCompleted().response();
+                    queue.put(new StreamEvent.ThinkingDelta(event.asReasoningSummaryTextDelta().delta()));
+                } else if (event.isCompleted() || event.isIncomplete()) {
+                    var resp = event.isCompleted() ? event.asCompleted().response() : event.asIncomplete().response();
+                    String stopReason = "end_turn";
+                    if (event.isIncomplete()) {
+                        String reason = resp.incompleteDetails()
+                                .flatMap(Response.IncompleteDetails::reason).map(Object::toString).orElse("unknown");
+                        if (!"max_output_tokens".equals(reason)) {
+                            throw new LlmException("Incomplete response: " + reason);
+                        }
+                        stopReason = "max_tokens";
+                    } else {
+                        for (var item : resp.output()) {
+                            if (!item.isFunctionCall()) continue;
+                            var call = item.asFunctionCall();
+                            @SuppressWarnings("unchecked")
+                            Map<String, Object> args = MAPPER.readValue(call.arguments(), Map.class);
+                            if (args == null) throw new LlmException("Invalid tool arguments for " + call.name());
+                            queue.put(new StreamEvent.ToolCallComplete(call.callId(), call.name(), args));
+                        }
+                    }
                     int inputTokens = 0, outputTokens = 0, cacheReadTokens = 0;
                     if (resp.usage().isPresent()) {
                         var usage = resp.usage().get();
                         outputTokens = (int) usage.outputTokens();
                         cacheReadTokens = (int) usage.inputTokensDetails().cachedTokens();
-                        // inputTokens already includes the cached portion; split
-                        // it out so the anchor does not double-count the hit.
                         inputTokens = Math.max(0, (int) usage.inputTokens() - cacheReadTokens);
                     }
-                    queue.put(new StreamEvent.StreamEnd(
-                            "end_turn", inputTokens, outputTokens, cacheReadTokens, 0));
+                    queue.put(new StreamEvent.StreamEnd(stopReason, inputTokens, outputTokens, cacheReadTokens, 0));
+                    return;
+                } else if (event.isError()) {
+                    throw new LlmException(event.asError().message());
+                } else if (event.isFailed()) {
+                    var error = event.asFailed().response().error();
+                    throw new LlmException(error.map(ResponseError::message).orElse("OpenAI response failed"));
                 }
             }
         }
+        throw new LlmException.NetworkException("OpenAI stream ended prematurely", null);
     }
 
     private List<ResponseInputItem> buildInput(List<Message> messages) {

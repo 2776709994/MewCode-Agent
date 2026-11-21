@@ -48,7 +48,7 @@ public final class SkillExecutor {
     public static String executeFork(Skill skill, String args, SkillForkHost host) {
         assertAllowedToolsExist(skill, host.toolRegistry());
         String body = substituteArguments(skill.promptBody(), args);
-        host.recordSkillInvocation(skill.meta().name(), skill.promptBody());
+        host.recordSkillInvocation(skill.meta().name(), body);
         List<Message> seed = buildForkSeed(skill.meta().forkContext(), host.snapshotParentMessages());
         return host.runSubAgent(body, seed, skill.meta().allowedTools(), skill.meta().model());
     }
@@ -73,7 +73,10 @@ public final class SkillExecutor {
                 if (parent.size() <= FORK_RECENT_COUNT) {
                     yield new ArrayList<>(parent);
                 }
-                yield new ArrayList<>(parent.subList(parent.size() - FORK_RECENT_COUNT, parent.size()));
+                int start = parent.size() - FORK_RECENT_COUNT;
+                while (start > 0 && parent.get(start).getToolResults() != null
+                        && !parent.get(start).getToolResults().isEmpty()) start--;
+                yield new ArrayList<>(parent.subList(start, parent.size()));
             }
             default -> List.of();
         };

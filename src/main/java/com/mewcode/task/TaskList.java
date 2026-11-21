@@ -190,6 +190,10 @@ public class TaskList {
         Object statusVal = updates.get("status");
         if (statusVal instanceof String s && "deleted".equals(s)) {
             tasks.removeIf(t -> t.id.equals(id));
+            for (Task task : tasks) {
+                if (task.blocks != null) task.blocks.remove(id);
+                if (task.blockedBy != null) task.blockedBy.remove(id);
+            }
             save(tasks);
             return Optional.of(new UpdateResult(target, List.of("deleted")));
         }
@@ -294,17 +298,27 @@ public class TaskList {
             if (data.length == 0) {
                 return new ArrayList<>();
             }
-            return MAPPER.readValue(data, new TypeReference<List<Task>>() {});
+            var tasks = MAPPER.readValue(data, new TypeReference<List<Task>>() {});
+            if (tasks == null || tasks.stream().anyMatch(task -> task == null || task.id == null)) {
+                throw new IOException("Invalid task list");
+            }
+            return tasks;
         } catch (IOException e) {
-            // Corrupted or unreadable file — start fresh
-            return new ArrayList<>();
+            throw new java.io.UncheckedIOException("Could not read task list: " + storePath, e);
         }
     }
 
     private void save(List<Task> tasks) {
         try {
             Files.createDirectories(storePath.getParent());
-            MAPPER.writeValue(storePath.toFile(), tasks);
+            Path temporary = Files.createTempFile(storePath.getParent(), "tasks-", ".tmp");
+            try {
+                MAPPER.writeValue(temporary.toFile(), tasks);
+                Files.move(temporary, storePath, java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            } finally {
+                Files.deleteIfExists(temporary);
+            }
         } catch (IOException e) {
             throw new RuntimeException("Failed to save task list to " + storePath, e);
         }

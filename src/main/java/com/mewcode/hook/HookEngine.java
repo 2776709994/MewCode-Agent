@@ -195,22 +195,12 @@ public class HookEngine {
 
     private HookResult executeCommand(Hook h, HookContext ctx) {
         try {
-            ProcessBuilder pb = new ProcessBuilder("bash", "-c", h.action().command());
+            ProcessBuilder pb = new ProcessBuilder(com.mewcode.tool.impl.BashTool.bashExecutable(), "-c", h.action().command());
             Map<String, String> env = pb.environment();
             env.put("MEWCODE_EVENT", ctx.event() != null ? ctx.event().value() : "");
             env.put("MEWCODE_TOOL",  ctx.toolName() != null ? ctx.toolName() : "");
-            pb.redirectErrorStream(false);
-
-            Process proc = pb.start();
-            String stdout = new String(proc.getInputStream().readAllBytes()).strip();
-            String stderr = new String(proc.getErrorStream().readAllBytes()).strip();
-            int code = proc.waitFor();
-
-            String output = stdout;
-            if (!stderr.isEmpty()) {
-                output = output.isEmpty() ? stderr : output + "\n" + stderr;
-            }
-            return new HookResult(h.id(), output, code == 0, h.reject());
+            var result = com.mewcode.ProcessExecution.capture(pb, java.time.Duration.ofSeconds(30));
+            return new HookResult(h.id(), result.output().strip(), result.exitCode() == 0, h.reject());
         } catch (IOException | InterruptedException e) {
             if (e instanceof InterruptedException) {
                 Thread.currentThread().interrupt();

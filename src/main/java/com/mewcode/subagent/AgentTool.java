@@ -50,6 +50,39 @@ public class AgentTool implements Tool {
 
     /** Optional: task manager for background agent execution. */
     private SubAgentTaskManager taskManager;
+    private java.util.function.Supplier<com.mewcode.permission.PermissionMode> parentPermissionMode;
+    private java.util.function.Supplier<java.nio.file.Path> parentWorkDir;
+
+    public void setExecutionContext(java.util.function.Supplier<com.mewcode.permission.PermissionMode> mode,
+                                    java.util.function.Supplier<java.nio.file.Path> workDir) {
+        parentPermissionMode = mode;
+        parentWorkDir = workDir;
+    }
+
+    private com.mewcode.permission.PermissionMode childMode(SubAgentSpec spec) {
+        var mode = parentPermissionMode == null ? com.mewcode.permission.PermissionMode.DEFAULT
+                : parentPermissionMode.get();
+        if (spec.name().equals("plan") || spec.name().equals("explore")
+                || mode == com.mewcode.permission.PermissionMode.PLAN) {
+            return com.mewcode.permission.PermissionMode.PLAN;
+        }
+        return mode == com.mewcode.permission.PermissionMode.BYPASS
+                ? com.mewcode.permission.PermissionMode.ACCEPT_EDITS : mode;
+    }
+
+    private String parentRoot() {
+        return parentWorkDir == null ? System.getProperty("user.dir") : parentWorkDir.get().toString();
+    }
+
+    private com.mewcode.worktree.AgentWorktree.Result isolatedWorktree(String isolation) throws Exception {
+        if (isolation == null || isolation.isBlank()) return null;
+        if (!"worktree".equals(isolation) || worktreeManager == null) {
+            throw new IllegalArgumentException("Worktree isolation is unavailable");
+        }
+        String slug = "agent-" + java.util.UUID.randomUUID();
+        return com.mewcode.worktree.AgentWorktree.create(
+                slug, parentRoot(), worktreeManager.getSymlinkDirs());
+    }
 
     /** Optional: parent conversation for fork support. */
     private ConversationManager parentConversation;
@@ -244,13 +277,13 @@ public class AgentTool implements Tool {
         if (teamName != null && !teamName.isEmpty() && teamManager != null) {
             SubAgentSpec spec = (subagentType != null && !subagentType.isEmpty())
                     ? resolveSpec(subagentType) : resolveSpec("general-purpose");
-            if (spec == null) spec = resolveSpec("general-purpose");
+            if (spec == null) return ToolResult.error("Unknown sub-agent type: " + subagentType);
             return runAsTeammate(spec, teamName, description, prompt, modelOverride, isolation);
         }
 
         // Fork path: no subagent_type specified.
         if (subagentType == null || subagentType.isEmpty()) {
-            return runFork(description, prompt, modelOverride);
+            return runFork(description, prompt, modelOverride, isolation);
         }
 
         // Resolve the spec
@@ -266,25 +299,55 @@ public class AgentTool implements Tool {
         boolean runInBackground = Boolean.TRUE.equals(args.get("run_in_background"));
 
         if (runInBackground) {
-            return runAsync(spec, description, prompt, modelOverride);
+            return runAsync(spec, description, prompt, modelOverride, isolation);
         }
         return runSync(spec, description, prompt, modelOverride, isolation);
     }
 
     // ---- Internal ----
 
-    private ToolResult runAsync(SubAgentSpec spec, String description, String prompt, String modelOverride) {
+    private ToolResult runAsync(SubAgentSpec spec, String description, String prompt, String modelOverride, String isolation) {
         if (taskManager == null) {
             return ToolResult.error("Background execution not available (no task manager configured)");
         }
         LlmClient subClient = selectClient(spec.model(), modelOverride);
-        String taskId = taskManager.spawnSubAgent(subClient, parentRegistry, protocol, providerConfig, spec, prompt);
+        var conv = new ConversationManager();
+        conv.addUserMessage(prompt);
+        return launchBackground(spec, description, prompt, isolation, subClient, conv, null);
+    }
+
+    private ToolResult launchBackground(SubAgentSpec spec, String description, String prompt, String isolation,
+                                        LlmClient subClient, ConversationManager conv,
+                                        com.mewcode.toolresult.ContentReplacementState state) {
+        com.mewcode.worktree.AgentWorktree.Result worktree;
+        try {
+            worktree = isolatedWorktree(isolation);
+        } catch (Exception e) {
+            return ToolResult.error("Error creating agent worktree: " + e.getMessage());
+        }
+        String workDir = worktree == null ? parentRoot() : worktree.worktreePath();
+        if (worktree != null) conv.addSystemReminder(
+                com.mewcode.worktree.AgentWorktree.buildNotice(parentRoot(), workDir));
+        String taskId = taskManager.spawnConfigured(subClient, ToolFilter.filterForAgent(parentRegistry, spec, true, false, false),
+                protocol, providerConfig, spec, prompt, state, conv, workDir, childMode(spec), worktree);
         return ToolResult.success(
                 "Agent \"%s\" launched in background (task %s). You will be notified when it completes."
                         .formatted(description, taskId));
     }
 
-    private ToolResult runFork(String description, String prompt, String modelOverride) {
+    public String launchSkill(String name, String body, List<com.mewcode.conversation.Message> seed,
+                              List<String> allowedTools, String model) {
+        if (taskManager == null) throw new IllegalStateException("Background skill execution is unavailable");
+        var spec = new SubAgentSpec(name, "", allowedTools, List.of(), null, 200, model);
+        var conv = new ConversationManager();
+        conv.getMessagesMutable().addAll(seed);
+        conv.addUserMessage(body);
+        ToolResult result = launchBackground(spec, name, body, null, selectClient(null, model), conv, null);
+        if (result.isError()) throw new IllegalStateException(result.output());
+        return result.output();
+    }
+
+    private ToolResult runFork(String description, String prompt, String modelOverride, String isolation) {
         if (parentConversation == null) {
             return ToolResult.error("Error: fork requires parent conversation context");
         }
@@ -303,38 +366,21 @@ public class AgentTool implements Tool {
         ConversationManager forkedConv = buildForkedConversation(parentConversation, prompt);
 
         LlmClient subClient = selectClient(null, modelOverride);
-        // Fork always runs in background; the parent's replacement state is
-        // passed so the child inherits a clone (byte-stable prompt cache).
-        String taskId = taskManager.spawnSubAgent(
-                subClient, parentRegistry, protocol, providerConfig, SubAgentSpec.GENERAL_PURPOSE,
-                FORK_BOILERPLATE + "\n\nYour task:\n" + prompt,
-                parentReplacementState);
-
-        return ToolResult.success(
-                "Forked agent \"%s\" launched in background (task %s). Results will arrive via task-notification."
-                        .formatted(description, taskId));
+        return launchBackground(SubAgentSpec.GENERAL_PURPOSE, description, prompt, isolation,
+                subClient, forkedConv, parentReplacementState);
     }
 
     private static ConversationManager buildForkedConversation(ConversationManager parent, String task) {
-        ConversationManager forked = new ConversationManager();
-        for (var msg : parent.getMessages()) {
-            if (msg.getToolUses() != null && !msg.getToolUses().isEmpty()
-                    && (msg.getToolResults() == null || msg.getToolResults().isEmpty())) {
-                // Assistant message with pending tool_use - patch with placeholder results
-                forked.addAssistantFull(msg.getContent(), msg.getThinkingBlocks(), msg.getToolUses());
-                var placeholders = msg.getToolUses().stream()
-                        .map(tu -> new com.mewcode.conversation.ToolResultBlock(
-                                tu.toolUseId(), "(tool execution interrupted by fork)", false))
-                        .toList();
-                forked.addToolResultsMessage(placeholders);
-            } else if (msg.getToolUses() != null && !msg.getToolUses().isEmpty()) {
-                forked.addAssistantFull(msg.getContent(), msg.getThinkingBlocks(), msg.getToolUses());
-            } else if (msg.getToolResults() != null && !msg.getToolResults().isEmpty()) {
-                forked.addToolResultsMessage(msg.getToolResults());
-            } else if ("assistant".equals(msg.getRole())) {
-                forked.addAssistantMessage(msg.getContent());
-            } else {
-                forked.addUserMessage(msg.getContent());
+        var forked = new ConversationManager();
+        var messages = parent.getMessages();
+        forked.getMessagesMutable().addAll(messages);
+        if (!messages.isEmpty()) {
+            var pending = messages.getLast().getToolUses();
+            if (pending != null && !pending.isEmpty()) {
+                forked.addToolResultsMessage(pending.stream()
+                        .map(call -> new com.mewcode.conversation.ToolResultBlock(
+                                call.toolUseId(), "(tool execution interrupted by fork)", false))
+                        .toList());
             }
         }
         forked.addUserMessage(FORK_BOILERPLATE + "\n\nYour task:\n" + task);
@@ -350,23 +396,17 @@ public class AgentTool implements Tool {
         subAgent.setMaxIterations(maxTurns);
 
         // Worktree isolation via AgentWorktree API
-        com.mewcode.worktree.AgentWorktree.Result wtResult = null;
-        if ("worktree".equals(isolation) && worktreeManager != null) {
-            byte[] rndBytes = new byte[4];
-            new java.security.SecureRandom().nextBytes(rndBytes);
-            String slug = "agent-a" + java.util.HexFormat.of().formatHex(rndBytes).substring(0, 7);
-            try {
-                wtResult = com.mewcode.worktree.AgentWorktree.create(
-                        slug, worktreeManager.getProjectRoot(), worktreeManager.getSymlinkDirs());
-                subAgent.setWorkDir(wtResult.worktreePath());
-                // Inject worktree notice into prompt
-                String notice = com.mewcode.worktree.AgentWorktree.buildNotice(
-                        System.getProperty("user.dir"), wtResult.worktreePath());
-                prompt = notice + "\n\n" + prompt;
-            } catch (Exception e) {
-                return ToolResult.error("Error creating agent worktree: " + e.getMessage());
-            }
+        com.mewcode.worktree.AgentWorktree.Result wtResult;
+        try {
+            wtResult = isolatedWorktree(isolation);
+        } catch (Exception e) {
+            return ToolResult.error("Error creating agent worktree: " + e.getMessage());
         }
+        String workDir = wtResult == null ? parentRoot() : wtResult.worktreePath();
+        subAgent.setWorkDir(workDir);
+        subAgent.setHeadlessMode(childMode(spec));
+        if (wtResult != null) prompt = com.mewcode.worktree.AgentWorktree.buildNotice(parentRoot(), workDir)
+                + "\n\n" + prompt;
 
         ConversationManager conv = new ConversationManager();
         if (spec.systemPromptOverride() != null && !spec.systemPromptOverride().isEmpty()) {
@@ -380,69 +420,63 @@ public class AgentTool implements Tool {
 
         BlockingQueue<AgentEvent> queue = subAgent.run(conv);
 
-        while (true) {
-            AgentEvent event;
-            try {
-                event = queue.poll(60, TimeUnit.SECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                emitProgress(description, spec.name(), true, true, toolCount, elapsedSeconds(startNanos));
-                return ToolResult.error("Agent interrupted");
-            }
-
-            if (event == null) {
-                emitProgress(description, spec.name(), true, true, toolCount, elapsedSeconds(startNanos));
-                return ToolResult.error("Agent timed out waiting for events");
-            }
-
-            switch (event) {
-                case AgentEvent.StreamText st -> output.append(st.text());
-
-                case AgentEvent.ToolResultEvent tre -> {
-                    toolCount++;
-                    emitProgress(description, spec.name(), tre.toolName(), tre.output(),
-                            tre.isError(), false, toolCount, elapsedSeconds(startNanos));
-                }
-
-                case AgentEvent.ErrorEvent err -> {
+        try {
+            while (true) {
+                AgentEvent event;
+                try {
+                    event = queue.poll(60, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
                     emitProgress(description, spec.name(), true, true, toolCount, elapsedSeconds(startNanos));
-                    return ToolResult.error("Agent failed: " + err.message());
+                    return ToolResult.error("Agent interrupted");
                 }
 
-                case AgentEvent.LoopComplete lc -> {
-                    // Agent finished
-                    double totalTime = elapsedSeconds(startNanos);
-                    emitProgress(description, spec.name(), false, true, toolCount, totalTime);
+                if (event == null) {
+                    emitProgress(description, spec.name(), true, true, toolCount, elapsedSeconds(startNanos));
+                    return ToolResult.error("Agent timed out waiting for events");
+                }
 
-                    String result = output.toString();
-                    if (result.isEmpty()) {
-                        result = "(agent produced no output)";
+                switch (event) {
+                    case AgentEvent.StreamText st -> output.append(st.text());
+
+                    case AgentEvent.ToolResultEvent tre -> {
+                        toolCount++;
+                        emitProgress(description, spec.name(), tre.toolName(), tre.output(),
+                                tre.isError(), false, toolCount, elapsedSeconds(startNanos));
                     }
 
-                    // Worktree cleanup via WorktreeChanges API (fail-closed)
-                    String wtInfo = "";
-                    if (wtResult != null) {
-                        if (com.mewcode.worktree.WorktreeChanges.hasChanges(
-                                wtResult.worktreePath(), wtResult.headCommit())) {
-                            wtInfo = "\n\nWorktree kept at %s (branch %s) — has uncommitted changes or new commits."
-                                    .formatted(wtResult.worktreePath(), wtResult.worktreeBranch());
-                        } else {
-                            com.mewcode.worktree.AgentWorktree.remove(
-                                    wtResult.worktreePath(), wtResult.worktreeBranch(), wtResult.gitRoot());
+                    case AgentEvent.ErrorEvent err -> {
+                        emitProgress(description, spec.name(), true, true, toolCount, elapsedSeconds(startNanos));
+                        return ToolResult.error("Agent failed: " + err.message());
+                    }
+
+                    case AgentEvent.LoopComplete lc -> {
+                        // Agent finished
+                        double totalTime = elapsedSeconds(startNanos);
+                        emitProgress(description, spec.name(), false, true, toolCount, totalTime);
+
+                        String result = output.toString();
+                        if (result.isEmpty()) {
+                            result = "(agent produced no output)";
                         }
+
+                        String wtInfo = wtResult == null ? "" : "\n\nWorktree: %s (branch %s)."
+                                .formatted(wtResult.worktreePath(), wtResult.worktreeBranch());
+
+                        long elapsedMs = Math.round(totalTime * 1000);
+                        return ToolResult.success(
+                                "Agent \"%s\" completed in %d.%03ds.\n\n%s%s".formatted(
+                                        description, elapsedMs / 1000, elapsedMs % 1000, result, wtInfo));
                     }
 
-                    long elapsedMs = Math.round(totalTime * 1000);
-                    return ToolResult.success(
-                            "Agent \"%s\" completed in %d.%03ds.\n\n%s%s".formatted(
-                                    description, elapsedMs / 1000, elapsedMs % 1000, result, wtInfo));
-                }
-
-                default -> {
-                    // ThinkingText, ThinkingComplete, ToolUseEvent, TurnComplete, UsageEvent, etc.
-                    // -- consumed but not surfaced to the parent
+                    default -> {
+                        // ThinkingText, ThinkingComplete, ToolUseEvent, TurnComplete, UsageEvent, etc.
+                        // -- consumed but not surfaced to the parent
+                    }
                 }
             }
+        } finally {
+            com.mewcode.EventQueue.cancel(queue);
         }
     }
 
@@ -465,18 +499,11 @@ public class AgentTool implements Tool {
             return ToolResult.error("Error: team '%s' not found. Create it first with TeamCreate.".formatted(teamName));
         }
 
-        // Deduplicate member name
-        String memberName = description.replaceAll("\\s+", "-").toLowerCase();
-        if (memberName.length() > 30) memberName = memberName.substring(0, 30);
-        int suffix = 2;
-        String base = memberName;
-        while (team.hasMember(memberName)) {
-            memberName = base + "-" + suffix++;
-        }
+        String memberName = team.uniqueMemberName(description);
 
         ToolRegistry subRegistry = ToolFilter.filterForAgent(parentRegistry, spec);
         // Add coordination tools for teammates
-        subRegistry.register(new com.mewcode.teams.TeamTools.SendMessageTool(teamManager, memberName));
+        subRegistry.register(new com.mewcode.teams.TeamTools.SendMessageTool(teamManager, memberName, teamName));
 
         LlmClient subClient = selectClient(spec.model(), modelOverride);
 
@@ -487,22 +514,15 @@ public class AgentTool implements Tool {
         String addendum = com.mewcode.teams.TeammateRunner.buildTeammateAddendum(
                 teamName, memberName, otherMembers);
 
-        // Optional worktree isolation
-        String workdir = null;
-        if ("worktree".equals(isolation) && worktreeManager != null) {
-            try {
-                byte[] rndBytes = new byte[4];
-                new java.security.SecureRandom().nextBytes(rndBytes);
-                String slug = "agent-a" + java.util.HexFormat.of().formatHex(rndBytes).substring(0, 7);
-                var wtResult = com.mewcode.worktree.AgentWorktree.create(
-                        slug, worktreeManager.getProjectRoot(), worktreeManager.getSymlinkDirs());
-                workdir = wtResult.worktreePath();
-                String notice = com.mewcode.worktree.AgentWorktree.buildNotice(
-                        System.getProperty("user.dir"), wtResult.worktreePath());
-                prompt = notice + "\n\n" + prompt;
-            } catch (Exception e) {
-                return ToolResult.error("Error creating teammate worktree: " + e.getMessage());
+        String workdir = parentRoot();
+        try {
+            var worktree = isolatedWorktree(isolation);
+            if (worktree != null) {
+                workdir = worktree.worktreePath();
+                prompt = com.mewcode.worktree.AgentWorktree.buildNotice(parentRoot(), workdir) + "\n\n" + prompt;
             }
+        } catch (Exception e) {
+            return ToolResult.error("Error creating teammate worktree: " + e.getMessage());
         }
 
         // Spawn teammate
@@ -510,7 +530,7 @@ public class AgentTool implements Tool {
             var spawnResult = com.mewcode.teams.SpawnDispatcher.spawnTeammate(
                     new com.mewcode.teams.SpawnDispatcher.SpawnConfig(
                             team, memberName, prompt, addendum,
-                            subClient, subRegistry, protocol, providerConfig, workdir));
+                            subClient, subRegistry, protocol, providerConfig, workdir, childMode(spec)));
 
             return ToolResult.success(
                     "Teammate \"%s\" spawned in team \"%s\" (mode: %s). The teammate is now working on the assigned task."

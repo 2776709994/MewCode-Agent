@@ -72,13 +72,11 @@ public class EditFileTool implements Tool {
     public ToolResult execute(Map<String, Object> args) {
         String filePath = stringArg(args, "file_path", "");
         String oldStr = stringArg(args, "old_string", "");
-        String newStr = stringArg(args, "new_string", "");
+        if (!(args.get("new_string") instanceof String newStr)) return ToolResult.error("Error: new_string is required");
 
         if (filePath.isEmpty()) {
             return ToolResult.error("Error: file_path is required");
         }
-
-        if (fileHistory != null) fileHistory.trackEdit(filePath);
 
         Path path = Path.of(filePath);
 
@@ -95,6 +93,9 @@ public class EditFileTool implements Tool {
 
         String content;
         try {
+            if (!Files.isRegularFile(path) || Files.size(path) > 8 * 1024 * 1024) {
+                return ToolResult.error("Error: expected a regular file of at most 8 MiB");
+            }
             content = Files.readString(path);
         } catch (IOException e) {
             return ToolResult.error("Error reading file: " + e.getMessage());
@@ -111,6 +112,7 @@ public class EditFileTool implements Tool {
         String newContent = content.replace(oldStr, newStr);
 
         try {
+            if (fileHistory != null) fileHistory.trackEdit(filePath);
             Files.writeString(path, newContent);
         } catch (IOException e) {
             return ToolResult.error("Error writing file: " + e.getMessage());

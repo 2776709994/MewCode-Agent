@@ -84,7 +84,7 @@ public class PlanApprovalDialog {
      */
     public void activate() {
         active = true;
-        cursor = 0;
+        cursor = 1;
         feedbackInput.setLength(0);
     }
 

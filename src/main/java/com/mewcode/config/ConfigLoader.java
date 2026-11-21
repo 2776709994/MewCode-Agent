@@ -115,8 +115,17 @@ public class ConfigLoader {
     }
 
     private static void validate(AppConfig cfg) throws ConfigException {
+        try {
+            com.mewcode.permission.PermissionMode.fromConfig(cfg.getPermissionMode());
+        } catch (IllegalArgumentException e) {
+            throw new ConfigException("Invalid permission_mode: " + cfg.getPermissionMode());
+        }
+        if (cfg.getProviders() == null || cfg.getProviders().isEmpty()) {
+            throw new ConfigException("At least one LLM provider is required");
+        }
         for (int i = 0; i < cfg.getProviders().size(); i++) {
             var p = cfg.getProviders().get(i);
+            if (p == null) throw new ConfigException("Provider #" + (i + 1) + " is empty");
             var missing = new ArrayList<String>();
 
             if (isBlank(p.getName())) missing.add("name");

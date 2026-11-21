@@ -33,7 +33,7 @@ public class PlanFile {
             "vision", "path", "route", "guide", "frame",
     };
 
-    private static String currentPlanPath;
+    private static volatile String currentPlanPath;
 
     // ── Slug generation ─────────────────────────────────────────────────
 
@@ -55,18 +55,18 @@ public class PlanFile {
 
     // ── Path management ─────────────────────────────────────────────────
 
-    public static String getOrCreatePlanPath(String workDir) {
-        if (currentPlanPath != null) {
+    public static synchronized String getOrCreatePlanPath(String workDir) {
+        Path dir = Path.of(workDir, PLANS_DIR).toAbsolutePath().normalize();
+        if (currentPlanPath != null && dir.equals(Path.of(currentPlanPath).toAbsolutePath().normalize().getParent())) {
             return currentPlanPath;
         }
-        Path dir = Path.of(workDir, PLANS_DIR);
         try {
             Files.createDirectories(dir);
         } catch (IOException ignored) {
             // best effort
         }
         String slug = generateSlug();
-        currentPlanPath = dir.resolve(slug + ".md").toString();
+        currentPlanPath = dir.resolve(slug + "-" + java.util.UUID.randomUUID() + ".md").toString();
         return currentPlanPath;
     }
 
@@ -88,7 +88,7 @@ public class PlanFile {
     // ── Persistence ─────────────────────────────────────────────────────
 
     public static boolean planExists() {
-        return currentPlanPath != null && Files.exists(Path.of(currentPlanPath));
+        return currentPlanPath != null && Files.isRegularFile(Path.of(currentPlanPath), LinkOption.NOFOLLOW_LINKS);
     }
 
     public static String loadPlan() throws IOException {
@@ -113,9 +113,7 @@ public class PlanFile {
 
     /**
      * Returns {@code true} when {@code targetPath} refers to the same file
-     * as {@code planPath} (after normalization) or when one is a suffix of
-     * the other. This matches the Go helper
-     * {@code IsPlanFilePath(targetPath, planPath)}.
+     * as {@code planPath} after absolute path normalization.
      */
     public static boolean isPlanFilePath(String targetPath, String planPath) {
         if (planPath == null || planPath.isBlank()) {
@@ -123,6 +121,6 @@ public class PlanFile {
         }
         String cleanTarget = Path.of(targetPath).normalize().toString();
         String cleanPlan = Path.of(planPath).normalize().toString();
-        return cleanTarget.equals(cleanPlan) || cleanTarget.endsWith(cleanPlan);
+        return Path.of(cleanTarget).toAbsolutePath().equals(Path.of(cleanPlan).toAbsolutePath());
     }
 }

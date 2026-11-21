@@ -10,7 +10,6 @@ import com.mewcode.tui.SpinnerVerbs;
 
 import java.util.List;
 import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -35,8 +34,6 @@ public final class TeammateRunner {
             String initialPrompt,
             String addendum
     ) {
-        BlockingQueue<AgentEvent> eventOut = new LinkedBlockingQueue<>(32);
-
         // Create progress tracker and attach to member
         var progress = new TeammateProgress(member.getName(), team.getName(), SpinnerVerbs.random());
         member.progress = progress;
@@ -53,11 +50,11 @@ public final class TeammateRunner {
 
         // Run agent
         var agentQueue = member.agent.run(member.conv);
-        drainAgentEvents(agentQueue, eventOut, progress);
+        boolean completed = drainAgentEvents(agentQueue, progress);
 
         // Send idle notification
-        team.sendMessage(member.getName(), LEAD_NAME,
-                createIdleNotification(member.getName(), "completed initial task"));
+        if (!Thread.currentThread().isInterrupted()) team.sendMessage(member.getName(), LEAD_NAME,
+                createIdleNotification(member.getName(), completed ? "completed initial task" : "initial task failed"));
 
         // Subsequent turns: wait for mailbox messages
         while (!Thread.currentThread().isInterrupted()) {
@@ -66,10 +63,10 @@ public final class TeammateRunner {
 
             member.conv.addUserMessage(result.prompt);
             agentQueue = member.agent.run(member.conv);
-            drainAgentEvents(agentQueue, eventOut, progress);
+            completed = drainAgentEvents(agentQueue, progress);
 
-            team.sendMessage(member.getName(), LEAD_NAME,
-                    createIdleNotification(member.getName(), "completed follow-up"));
+            if (!Thread.currentThread().isInterrupted()) team.sendMessage(member.getName(), LEAD_NAME,
+                    createIdleNotification(member.getName(), completed ? "completed follow-up" : "follow-up failed"));
         }
 
         member.active = false;
@@ -86,7 +83,7 @@ public final class TeammateRunner {
         for (String teamName : teamMgr.listTeams()) {
             var team = teamMgr.getTeam(teamName);
             if (team == null) continue;
-            var messages = team.getMailBox().readUnread(LEAD_NAME);
+            var messages = team.getMailBox().drainUnread(LEAD_NAME);
             if (messages.isEmpty()) continue;
 
             var sb = new StringBuilder();
@@ -97,7 +94,6 @@ public final class TeammateRunner {
             sb.append("</team-notification>");
             result.add(sb.toString());
 
-            team.getMailBox().markAllRead(LEAD_NAME);
         }
         return result;
     }
@@ -126,7 +122,7 @@ public final class TeammateRunner {
             TeamManager.Team team, String memberName,
             com.mewcode.conversation.ConversationManager conv
     ) {
-        var messages = team.getMailBox().readUnread(memberName);
+        var messages = team.getMailBox().drainUnread(memberName);
         if (messages.isEmpty()) return;
 
         var sb = new StringBuilder("You have new messages:\n\n");
@@ -134,7 +130,6 @@ public final class TeammateRunner {
             sb.append("From ").append(msg.from()).append(": ").append(msg.text()).append("\n\n");
         }
         conv.addSystemReminder(sb.toString());
-        team.getMailBox().markAllRead(memberName);
     }
 
     public static boolean isShutdownRequest(String message) {
@@ -159,12 +154,11 @@ public final class TeammateRunner {
                 return new WaitResult(null, true);
             }
 
-            var messages = team.getMailBox().readUnread(memberName);
+            var messages = team.getMailBox().drainUnread(memberName);
             if (messages.isEmpty()) continue;
 
             for (var msg : messages) {
                 if (isShutdownRequest(msg.text())) {
-                    team.getMailBox().markAllRead(memberName);
                     return new WaitResult(null, true);
                 }
             }
@@ -174,37 +168,38 @@ public final class TeammateRunner {
             for (var msg : messages) {
                 sb.append("From ").append(msg.from()).append(": ").append(msg.text()).append("\n\n");
             }
-            team.getMailBox().markAllRead(memberName);
             return new WaitResult(sb.toString(), false);
         }
         return new WaitResult(null, true);
     }
 
-    private static void drainAgentEvents(BlockingQueue<AgentEvent> source, BlockingQueue<AgentEvent> sink,
-                                         TeammateProgress progress) {
-        while (true) {
-            AgentEvent event;
-            try {
-                event = source.poll(60, TimeUnit.SECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                progress.setStatus("failed");
-                return;
-            }
-            if (event == null) return;
-            sink.offer(event);
+    private static boolean drainAgentEvents(BlockingQueue<AgentEvent> source, TeammateProgress progress) {
+        try {
+            while (true) {
+                AgentEvent event;
+                try {
+                    event = source.poll(60, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    progress.setStatus("failed");
+                    return false;
+                }
+                if (event == null) return false;
 
-            // Record progress from agent events
-            if (event instanceof AgentEvent.ToolUseEvent tue) {
-                progress.recordToolUse(tue.toolName(), tue.args());
-            } else if (event instanceof AgentEvent.UsageEvent ue) {
-                progress.recordTokens(ue.inputTokens(), ue.outputTokens());
-            } else if (event instanceof AgentEvent.ErrorEvent) {
-                progress.setStatus("failed");
-                return;
-            } else if (event instanceof AgentEvent.LoopComplete) {
-                return;
+                // Record progress from agent events
+                if (event instanceof AgentEvent.ToolUseEvent tue) {
+                    progress.recordToolUse(tue.toolName(), tue.args());
+                } else if (event instanceof AgentEvent.UsageEvent ue) {
+                    progress.recordTokens(ue.inputTokens(), ue.outputTokens());
+                } else if (event instanceof AgentEvent.ErrorEvent) {
+                    progress.setStatus("failed");
+                    return false;
+                } else if (event instanceof AgentEvent.LoopComplete) {
+                    return true;
+                }
             }
+        } finally {
+            com.mewcode.EventQueue.cancel(source);
         }
     }
 }

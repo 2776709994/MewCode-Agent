@@ -63,7 +63,7 @@ public final class ToolResultBudget {
     ) {
         List<Message> messages = conv.getMessages();
         if (messages.isEmpty()) {
-            return new ApplyResult(conv, List.of());
+            return new ApplyResult(buildManager(messages), List.of());
         }
 
         Path spillDir = sessionDir.resolve(SPILL_SUBDIR);
@@ -187,6 +187,7 @@ public final class ToolResultBudget {
     private static String spillAndPreview(Path spillDir, ToolResultBlock tr) {
         try {
             Files.createDirectories(spillDir);
+            if (tr.toolUseId() == null || !tr.toolUseId().matches("[A-Za-z0-9_-]+")) return null;
             Path file = spillDir.resolve(tr.toolUseId());
             if (Files.exists(file) && Files.size(file) == tr.content().length()) {
                 return buildSpillPreview(tr.content().length(), file);

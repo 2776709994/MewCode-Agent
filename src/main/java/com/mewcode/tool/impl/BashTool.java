@@ -8,12 +8,19 @@ package com.mewcode.tool.impl;
 import com.mewcode.tool.Tool;
 import com.mewcode.tool.ToolCategory;
 import com.mewcode.tool.ToolResult;
+import com.mewcode.tool.ToolRegistry;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.file.Path;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 public class BashTool implements Tool {
 
@@ -76,36 +83,32 @@ public class BashTool implements Tool {
 
     @Override
     public ToolResult execute(Map<String, Object> args) {
+        return execute(args, Path.of(System.getProperty("user.dir")));
+    }
+
+    public ToolResult execute(Map<String, Object> args, Path workDir) {
         String command = stringArg(args, "command", "");
         if (command.isEmpty()) {
             return ToolResult.error("Error: command is required");
         }
 
         int timeout = intArg(args, "timeout", 120);
-        if (timeout > MAX_TIMEOUT) {
-            timeout = MAX_TIMEOUT;
-        }
+        timeout = Math.max(1, Math.min(timeout, MAX_TIMEOUT));
 
+        Process process = null;
         try {
-            ProcessBuilder pb = new ProcessBuilder("bash", "-c", command);
-            pb.redirectErrorStream(false);
-            Process process = pb.start();
-
-            // Read stdout and stderr concurrently to avoid blocking
-            String stdout;
-            String stderr;
-            try (InputStream stdoutStream = process.getInputStream();
-                 InputStream stderrStream = process.getErrorStream()) {
-                byte[] stdoutBytes = stdoutStream.readAllBytes();
-                stderr = new String(stderrStream.readAllBytes());
-                stdout = new String(stdoutBytes);
+            ProcessBuilder pb = new ProcessBuilder(bashExecutable(), "-c", command);
+            pb.directory(workDir.toFile());
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(timeout);
+            process = pb.start();
+            process.getOutputStream().close();
+            var stdoutTask = capture(process.getInputStream());
+            var stderrTask = capture(process.getErrorStream());
+            if (!process.waitFor(deadline - System.nanoTime(), TimeUnit.NANOSECONDS)) {
+                throw new TimeoutException();
             }
-
-            boolean finished = process.waitFor(timeout, TimeUnit.SECONDS);
-            if (!finished) {
-                process.destroyForcibly();
-                return ToolResult.error("Error: command timed out after " + timeout + "s");
-            }
+            String stdout = stdoutTask.get(deadline - System.nanoTime(), TimeUnit.NANOSECONDS);
+            String stderr = stderrTask.get(deadline - System.nanoTime(), TimeUnit.NANOSECONDS);
 
             int exitCode = process.exitValue();
 
@@ -127,12 +130,67 @@ public class BashTool implements Tool {
 
             return new ToolResult(sb.toString(), exitCode != 0);
 
-        } catch (IOException e) {
+        } catch (TimeoutException e) {
+            return ToolResult.error("Error: command timed out after " + timeout + "s");
+        } catch (IOException | ExecutionException e) {
             return ToolResult.error("Error executing command: " + e.getMessage());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return ToolResult.error("Error: command interrupted");
+        } finally {
+            if (process != null && process.isAlive()) {
+                process.descendants().forEach(ProcessHandle::destroyForcibly);
+                process.destroyForcibly();
+            }
         }
+    }
+
+    public static String bashExecutable() {
+        if (System.getProperty("os.name", "").startsWith("Windows")) {
+            for (String env : List.of("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA")) {
+                String dir = System.getenv(env);
+                if (dir == null || dir.isBlank()) continue;
+                Path root = Path.of(dir);
+                if ("LOCALAPPDATA".equals(env)) root = root.resolve("Programs");
+                Path candidate = root.resolve("Git/bin/bash.exe");
+                if (java.nio.file.Files.isRegularFile(candidate)) return candidate.toString();
+            }
+            String path = System.getenv("PATH");
+            if (path != null) {
+                for (String entry : path.split(java.io.File.pathSeparator)) {
+                    try {
+                        Path bin = Path.of(entry.replace("\"", "")).toAbsolutePath();
+                        Path root = bin.getParent();
+                        if (root == null || !java.nio.file.Files.isRegularFile(bin.resolve("git.exe"))) continue;
+                        Path candidate = root.resolve("bin/bash.exe");
+                        if (java.nio.file.Files.isRegularFile(candidate)) return candidate.toString();
+                    } catch (java.nio.file.InvalidPathException ignored) {
+                        // Ignore malformed entries in PATH.
+                    }
+                }
+            }
+        }
+        return "bash";
+    }
+
+    private static FutureTask<String> capture(InputStream stream) {
+        var task = new FutureTask<>(() -> {
+            try (stream; var output = new ByteArrayOutputStream()) {
+                byte[] buffer = new byte[4096];
+                int limit = ToolRegistry.MAX_OUTPUT_CHARS * 4;
+                boolean truncated = false;
+                int count;
+                while ((count = stream.read(buffer)) != -1) {
+                    int kept = Math.min(count, limit - output.size());
+                    output.write(buffer, 0, kept);
+                    truncated |= kept < count;
+                }
+                String text = output.toString(StandardCharsets.UTF_8);
+                return truncated ? text + "\n... (truncated)" : text;
+            }
+        });
+        Thread.startVirtualThread(task);
+        return task;
     }
 
     private static String stringArg(Map<String, Object> args, String key, String def) {

@@ -121,7 +121,12 @@ public class MewCodeModel implements Model {
     private AskUserTool askUserTool;
 
     // ── Advanced features ─────────────────────────────────────────────
-    private McpManager mcpManager;
+    private volatile McpManager mcpManager;
+    private volatile boolean interruptRequested;
+    private final PermissionMode initialMode;
+    private boolean planReady;
+    private String planForApproval;
+    private final Map<String, Integer> toolBlockIndexes = new java.util.HashMap<>();
     private SkillCatalog skillCatalog;
     private TaskList taskList;
     private MemoryManager memoryManager;
@@ -155,7 +160,6 @@ public class MewCodeModel implements Model {
     private String sessionId;
 
     // ── Plan mode ────────────────────────────────────────────────────
-    private PermissionMode prePlanMode = PermissionMode.DEFAULT;
     private final PlanApprovalDialog planApprovalDialog = new PlanApprovalDialog();
 
     // ── Tool blocks (accumulated during a turn, archived on TurnComplete) ──
@@ -199,9 +203,11 @@ public class MewCodeModel implements Model {
     // ── Custom message for agent events ─────────────────────────────────
     public record AgentEventMessage() implements Message {}
     public record MailboxPollMessage() implements Message {}
+    private record McpStatusMessage(List<String> errors) implements Message {}
 
     public MewCodeModel(List<ProviderConfig> providers, List<McpServerConfig> mcpServers,
-                        List<HookConfig> hookConfigs) {
+                        List<HookConfig> hookConfigs, PermissionMode initialMode) {
+        this.initialMode = initialMode;
         this.providers = providers != null ? providers : List.of();
         this.mcpServers = mcpServers != null ? mcpServers : List.of();
         this.hookConfigs = hookConfigs != null ? hookConfigs : List.of();
@@ -273,21 +279,19 @@ public class MewCodeModel implements Model {
      * otherwise sends a QuitMessage to exit the application.
      */
     public void handleSigint() {
-        if (streaming) {
-            savePartialResponse();
-            if (program != null) {
-                program.send(new AgentEventMessage());
-            }
-        } else {
-            if (program != null) {
-                program.send(new QuitMessage());
-            }
-        }
+        if (program != null) program.send(new QuitMessage());
     }
 
     // ────────────────────────────────────────────────────────────────────
     // Model interface
     // ────────────────────────────────────────────────────────────────────
+
+    public void shutdown() {
+        com.mewcode.EventQueue.cancel(agentQueue);
+        if (subAgentTaskManager != null) subAgentTaskManager.cancelAll();
+        teamManager.closeAll();
+        if (mcpManager != null) mcpManager.shutdown();
+    }
 
     @Override
     public Command init() {
@@ -311,13 +315,13 @@ public class MewCodeModel implements Model {
         // ── Ctrl+C / QuitMessage: interrupt streaming or quit ──────────
         if (msg instanceof QuitMessage) {
             if (streaming) {
-                savePartialResponse();
+                interruptResponse();
                 return UpdateResult.from(this);
             }
         }
         if (msg instanceof KeyPressMessage kpm && kpm.key().equals("ctrl+c")) {
             if (streaming) {
-                savePartialResponse();
+                interruptResponse();
                 return UpdateResult.from(this);
             }
             return UpdateResult.from(this, QuitMessage::new);
@@ -334,6 +338,11 @@ public class MewCodeModel implements Model {
             return UpdateResult.from(this);
         }
 
+        if (msg instanceof McpStatusMessage mcp) {
+            for (String error : mcp.errors()) chatMessages.add(new ChatMessage("error", "MCP: " + error));
+            return UpdateResult.from(this);
+        }
+
         // ── Agent streaming events ──────────────────────────────────────
         if (msg instanceof AgentEventMessage) {
             if (streaming) spinnerFrame++;
@@ -346,6 +355,9 @@ public class MewCodeModel implements Model {
                 return UpdateResult.from(this, poll);
             }
             var notes = new java.util.ArrayList<String>();
+            if (state != AppState.CHAT || agent == null) {
+                return UpdateResult.from(this, Command.tick(Duration.ofSeconds(2), t -> new MailboxPollMessage()));
+            }
             notes.addAll(com.mewcode.teams.TeammateRunner.drainLeadMailbox(teamManager));
             if (subAgentTaskManager != null) {
                 for (var n : subAgentTaskManager.drainNotifications()) {
@@ -366,6 +378,7 @@ public class MewCodeModel implements Model {
             thinkingVerb = SpinnerVerbs.random();
             streamBuf.setLength(0);
             toolBlocks.clear();
+            toolBlockIndexes.clear();
             agentQueue = agent.run(conversation);
             var pollCmd = Command.tick(POLL_INTERVAL, t -> new AgentEventMessage());
             return UpdateResult.from(this, pollCmd);
@@ -466,6 +479,12 @@ public class MewCodeModel implements Model {
             subAgentTaskManager = new SubAgentTaskManager();
             agentToolRef.setProgressListener(this::handleSubAgentProgress);
             agentToolRef.setTaskManager(subAgentTaskManager);
+            agentToolRef.setAgentSpecs(com.mewcode.subagent.AgentLoader.loadAll(Path.of(workDir)));
+            agentToolRef.setModelResolver(model -> providers.stream()
+                    .filter(p -> protocol.equals(p.getProtocol())
+                            && (model.equals(p.getName()) || model.equals(p.getModel())))
+                    .findFirst().map(p -> LlmClient.create(p, systemPrompt)).orElse(null));
+            sessionId = SessionManager.newId();
             registry.register(agentToolRef);
 
             // Worktree tools and integration
@@ -493,21 +512,14 @@ public class MewCodeModel implements Model {
             registry.register(new com.mewcode.teams.TeamTools.SendMessageTool(teamManager, "lead"));
 
             permChecker = new PermissionChecker(
-                    PermissionMode.DEFAULT, Path.of(workDir));
+                    initialMode, Path.of(workDir));
 
-            sessionId = com.mewcode.session.SessionManager.newId();
-            fileHistory = new com.mewcode.filehistory.FileHistory(workDir, sessionId);
-            var fileStateCache = new com.mewcode.tool.FileStateCache();
-            for (var t : registry.listTools()) {
-                if (t instanceof com.mewcode.tool.impl.EditFileTool ef) { ef.setFileHistory(fileHistory); ef.setFileStateCache(fileStateCache); }
-                if (t instanceof com.mewcode.tool.impl.WriteFileTool wf) { wf.setFileHistory(fileHistory); wf.setFileStateCache(fileStateCache); }
-                if (t instanceof com.mewcode.tool.impl.ReadFileTool rf) rf.setFileStateCache(fileStateCache);
-            }
             agent = new Agent(client, registry, protocol, selectedProvider);
-            agent.setFileHistory(fileHistory);
+            bindFileHistory(workDir, sessionId);
             agent.setInstructions(instructionsContent);
             agent.setMemoryContent(memoryContentField);
             agent.setChecker(permChecker);
+            agentToolRef.setExecutionContext(permChecker::getMode, agent::effectiveWorkDir);
             agent.setWorkDir(workDir);
             agent.setSessionId(sessionId);
 
@@ -520,18 +532,14 @@ public class MewCodeModel implements Model {
                 // Drain background task notifications (ch13)
                 if (subAgentTaskManager != null) {
                     for (var n : subAgentTaskManager.drainNotifications()) {
-                        notes.add("<task-notification>Task %s: %s (%s)</task-notification>"
-                                .formatted(n.taskId(), n.name(), n.status()));
+                        notes.add("<task-notification>Task %s: %s (%s)\\n%s</task-notification>"
+                                .formatted(n.taskId(), n.name(), n.status(), n.output()));
                     }
                 }
                 return notes;
             });
 
-            // Coordinator mode: restrict Lead's tools when teams exist
-            agent.setToolNameFilter(name -> {
-                if (teamMgrCapture.listTeams().isEmpty()) return true;
-                return com.mewcode.teams.Coordinator.isCoordinatorTool(name);
-            });
+            setSkillToolFilter(null);
 
             if (!mcpServers.isEmpty()) {
                 mcpConnecting = true;
@@ -543,11 +551,7 @@ public class MewCodeModel implements Model {
                         for (var t : result.tools()) registryRef.register(t);
                         mcpServerInfo = "Connected to %d MCP server(s), %d tools registered".formatted(
                             result.servers().size(), result.tools().size());
-                        synchronized (chatMessages) {
-                            for (var e : result.errors()) {
-                                chatMessages.add(new ChatMessage("error", "MCP: " + e));
-                            }
-                        }
+                        if (program != null) program.send(new McpStatusMessage(result.errors()));
                         var mcpParts = new ArrayList<String>();
                         for (var s : result.servers()) {
                             var sb2 = new StringBuilder();
@@ -556,7 +560,7 @@ public class MewCodeModel implements Model {
                                 sb2.append(s.instructions()).append("\n");
                             }
                             var toolNames = registryRef.listTools().stream()
-                                    .filter(t -> t.name().startsWith("mcp__" + s.name() + "__"))
+                                    .filter(t -> t.name().startsWith("mcp__" + McpManager.sanitizeName(s.name()) + "__"))
                                     .map(com.mewcode.tool.Tool::name)
                                     .toList();
                             if (!toolNames.isEmpty()) {
@@ -570,20 +574,14 @@ public class MewCodeModel implements Model {
                                     + String.join("\n\n", mcpParts);
                         }
                     } catch (Exception e) {
-                        synchronized (chatMessages) {
-                            chatMessages.add(new ChatMessage("error", "MCP init failed: " + e.getMessage()));
-                        }
+                        if (program != null) program.send(new McpStatusMessage(List.of(e.getMessage())));
                     } finally {
                         mcpConnecting = false;
                     }
                 });
             }
 
-            skillCatalog = new SkillCatalog();
-            var skillDir = Path.of(workDir, ".mewcode", "skills");
-            if (java.nio.file.Files.isDirectory(skillDir)) {
-                skillCatalog.loadFromDirectory(skillDir);
-            }
+            skillCatalog = SkillCatalog.loadCatalog(workDir);
 
             wireSkillsToAgent();
 
@@ -594,6 +592,29 @@ public class MewCodeModel implements Model {
             chatMessages.add(new ChatMessage("error",
                     "Failed to initialize: " + e.getMessage()));
         }
+    }
+
+    private void bindFileHistory(String workDir, String id) {
+        fileHistory = new com.mewcode.filehistory.FileHistory(workDir, id);
+        var cache = new com.mewcode.tool.FileStateCache();
+        for (var tool : registry.listTools()) {
+            if (tool instanceof com.mewcode.tool.impl.EditFileTool edit) {
+                edit.setFileHistory(fileHistory);
+                edit.setFileStateCache(cache);
+            } else if (tool instanceof com.mewcode.tool.impl.WriteFileTool write) {
+                write.setFileHistory(fileHistory);
+                write.setFileStateCache(cache);
+            } else if (tool instanceof com.mewcode.tool.impl.ReadFileTool read) {
+                read.setFileStateCache(cache);
+            }
+        }
+        agent.setFileHistory(fileHistory);
+    }
+
+    private void setSkillToolFilter(java.util.function.Predicate<String> skillFilter) {
+        agent.setToolNameFilter(name -> (skillFilter == null || skillFilter.test(name))
+                && (teamManager.listTeams().isEmpty()
+                    || com.mewcode.teams.Coordinator.isCoordinatorTool(name)));
     }
 
     private void wireSkillsToAgent() {
@@ -614,9 +635,27 @@ public class MewCodeModel implements Model {
 
         String captured = name;
         cmdRegistry.register(cmd, ctx -> {
-            var s = skillCatalog.get(captured);
-            if (s.isEmpty()) return "[skill error] not found: " + captured;
-            return s.get().promptBody();
+            var selected = skillCatalog.getFull(captured).orElseThrow();
+            var host = new com.mewcode.skill.SkillForkHost() {
+                @Override public void activateSkill(String name, String body) {}
+                @Override public void setToolFilter(java.util.function.Predicate<String> filter) {
+                    setSkillToolFilter(filter);
+                }
+                @Override public ToolRegistry toolRegistry() { return registry; }
+                @Override public void recordSkillInvocation(String name, String body) {
+                    agent.getRecoveryState().recordSkillInvocation(name, body);
+                }
+                @Override public List<com.mewcode.conversation.Message> snapshotParentMessages() {
+                    return conversation.getMessages();
+                }
+                @Override public String runSubAgent(String body, List<com.mewcode.conversation.Message> seed,
+                                                    List<String> allowed, String model) {
+                    return agentToolRef.launchSkill(captured, body, seed, allowed, model);
+                }
+            };
+            return "fork".equals(selected.meta().mode())
+                    ? com.mewcode.skill.SkillExecutor.executeFork(selected, ctx.args(), host)
+                    : com.mewcode.skill.SkillExecutor.executeInline(selected, ctx.args(), host);
         });
     }
 
@@ -801,7 +840,7 @@ public class MewCodeModel implements Model {
         if (key.equals("enter")) {
             if (inputBuffer.isEmpty()) return UpdateResult.from(this);
             if (streaming) {
-                savePartialResponse();
+                interruptResponse();
             }
             String text = inputBuffer.toString().trim();
             if (text.startsWith("/")) {
@@ -966,6 +1005,12 @@ public class MewCodeModel implements Model {
                     case "clear" -> {
                         chatMessages.clear();
                         conversation = new ConversationManager();
+                        sessionId = SessionManager.newId();
+                        if (agent != null) {
+                            agent.setSessionId(sessionId);
+                            bindFileHistory(System.getProperty("user.dir"), sessionId);
+                        }
+                        mcpInstructionsOk = false;
                     }
                     case "compact" -> {
                         if (agent != null) {
@@ -985,10 +1030,8 @@ public class MewCodeModel implements Model {
                     }
                     case "plan" -> {
                         if (permChecker != null) {
-                            prePlanMode = permChecker.getMode();
                             permChecker.setMode(PermissionMode.PLAN);
-                            String planPath = PlanFile.getOrCreatePlanPath(
-                                    System.getProperty("user.dir"));
+                            String planPath = PlanFile.getOrCreatePlanPath(agent.effectiveWorkDir().toString());
                             chatMessages.add(new ChatMessage("system",
                                     "Entered Plan mode. Plan file: %s\nExplore the codebase and design your approach."
                                             .formatted(planPath)));
@@ -1017,7 +1060,13 @@ public class MewCodeModel implements Model {
             }
             case PROMPT -> {
                 boolean isSkill = cmd.description() != null && cmd.description().endsWith("[skill]");
-                String prompt = cmdRegistry.execute(cmd.name(), buildCommandContext(args));
+                String prompt;
+                try {
+                    prompt = cmdRegistry.execute(cmd.name(), buildCommandContext(args));
+                } catch (IllegalStateException e) {
+                    chatMessages.add(new ChatMessage("error", e.getMessage()));
+                    yield UpdateResult.from(this);
+                }
 
                 String displayText = "/" + cmd.name();
                 if (args != null && !args.isEmpty()) displayText += " " + args;
@@ -1028,7 +1077,7 @@ public class MewCodeModel implements Model {
                 if (prompt != null && !prompt.isBlank()) {
                     conversation.addUserMessage(prompt);
                 }
-                if (args != null && !args.isEmpty()) {
+                if (!isSkill && args != null && !args.isEmpty()) {
                     conversation.addUserMessage(args);
                 }
 
@@ -1041,7 +1090,6 @@ public class MewCodeModel implements Model {
 
                 try {
                     agentQueue = agent.run(conversation);
-                    if (askUserTool != null) askUserTool.setEventQueue(agentQueue);
                 } catch (Exception e) {
                     streaming = false;
                     chatMessages.add(new ChatMessage("error", "Agent error: " + e.getMessage()));
@@ -1125,7 +1173,6 @@ public class MewCodeModel implements Model {
 
         try {
             agentQueue = agent.run(conversation);
-            if (askUserTool != null) askUserTool.setEventQueue(agentQueue);
         } catch (Exception e) {
             streaming = false;
             chatMessages.add(new ChatMessage("error", "Agent error: " + e.getMessage()));
@@ -1156,31 +1203,20 @@ public class MewCodeModel implements Model {
                 case AgentEvent.ThinkingText e -> {}
                 case AgentEvent.ThinkingComplete e -> {}
                 case AgentEvent.ToolUseEvent e -> {
-                    boolean found = false;
-                    for (int i = 0; i < toolBlocks.size(); i++) {
-                        if (toolBlocks.get(i).toolName().equals(e.toolName())
-                                && toolBlocks.get(i).args() == null) {
-                            toolBlocks.set(i, new ChatMessage.ToolBlockInfo(
-                                    e.toolName(), e.args(), null, false, 0, false, true));
-                            found = true;
-                            break;
-                        }
-                    }
-                    if (!found) {
-                        toolBlocks.add(new ChatMessage.ToolBlockInfo(
-                                e.toolName(), e.args(), null, false, 0, false, true));
-                    }
+                    var block = new ChatMessage.ToolBlockInfo(
+                            e.toolName(), e.args(), null, false, 0, false, true);
+                    Integer index = toolBlockIndexes.putIfAbsent(e.toolId(), toolBlocks.size());
+                    if (index == null) toolBlocks.add(block);
+                    else toolBlocks.set(index, block);
                 }
                 case AgentEvent.ToolResultEvent e -> {
-                    for (int i = 0; i < toolBlocks.size(); i++) {
-                        var tb = toolBlocks.get(i);
-                        if (tb.toolName().equals(e.toolName()) && tb.loading()) {
-                            toolBlocks.set(i, new ChatMessage.ToolBlockInfo(
-                                    e.toolName(), tb.args(), e.output(), e.isError(),
-                                    e.elapsed(), true, false));
-                            break;
-                        }
+                    Integer index = toolBlockIndexes.get(e.toolId());
+                    if (index != null) {
+                        var block = toolBlocks.get(index);
+                        toolBlocks.set(index, new ChatMessage.ToolBlockInfo(e.toolName(), block.args(), e.output(),
+                                e.isError(), e.elapsed(), true, false));
                     }
+                    if ("ExitPlanMode".equals(e.toolName()) && !e.isError()) planReady = true;
                 }
                 case AgentEvent.TurnComplete e -> {
                     if (!streamBuf.isEmpty()) {
@@ -1193,7 +1229,6 @@ public class MewCodeModel implements Model {
                     loopDone = true;
                     if (!streamBuf.isEmpty()) {
                         chatMessages.add(new ChatMessage("assistant", streamBuf.toString()));
-                        SessionManager.saveMessage(System.getProperty("user.dir"), sessionId, "assistant", streamBuf.toString());
                         streamBuf.setLength(0);
                     }
                     commitToolBlocks();
@@ -1237,11 +1272,33 @@ public class MewCodeModel implements Model {
         if (loopDone) {
             streaming = false;
             agentQueue = null;
-            drainTaskNotifications();
-            triggerMemoryExtraction();
-            if (permChecker != null && permChecker.getMode() == PermissionMode.PLAN) {
-                planApprovalDialog.activate();
+            permDialog = false;
+            pendingPermission = null;
+            if (askUserFuture != null) {
+                askUserDialogState.reset();
+                askUserFuture = null;
             }
+            if (interruptRequested) {
+                chatMessages.add(new ChatMessage("system", "(response interrupted)"));
+            } else {
+                triggerMemoryExtraction();
+            }
+            if (!interruptRequested && planReady && permChecker != null && permChecker.getMode() == PermissionMode.PLAN) {
+                try {
+                    planForApproval = PlanFile.loadPlan();
+                    if (!planForApproval.isBlank()) {
+                        chatMessages.add(new ChatMessage("assistant", planForApproval));
+                        planApprovalDialog.activate();
+                    } else {
+                        chatMessages.add(new ChatMessage("error", "The plan is empty."));
+                    }
+                } catch (java.io.IOException e) {
+                    chatMessages.add(new ChatMessage("error", "Could not read the plan: " + e.getMessage()));
+                }
+            }
+            planReady = false;
+            interruptRequested = false;
+            setSkillToolFilter(null);
             if (teamManager != null) {
                 var mailboxPoll = Command.tick(Duration.ofSeconds(2), t -> new MailboxPollMessage());
                 return UpdateResult.from(this, mailboxPoll);
@@ -1273,7 +1330,8 @@ public class MewCodeModel implements Model {
     private void triggerMemoryExtraction() {
         if (memoryManager == null || client == null) return;
         if (!memoryManager.shouldExtract()) return;
-        Thread.startVirtualThread(() -> memoryManager.extract(client, conversation));
+        var snapshot = conversation.getMessages();
+        Thread.startVirtualThread(() -> memoryManager.extract(client, snapshot));
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -1302,6 +1360,7 @@ public class MewCodeModel implements Model {
                 miniConv.addUserMessage(userMessage);
                 BlockingQueue<com.mewcode.llm.StreamEvent> events = sideClient.stream(miniConv, null);
                 var sb = new StringBuilder();
+                try {
                 while (true) {
                     var event = events.take();
                     if (event instanceof com.mewcode.llm.StreamEvent.TextDelta td) {
@@ -1312,6 +1371,9 @@ public class MewCodeModel implements Model {
                     }
                 }
                 return sb.toString();
+                } finally {
+                    com.mewcode.EventQueue.cancel(events);
+                }
             };
             var results = MemoryRecall.findRelevantMemories(
                     query, userDir, projectDir, null, null, selector);
@@ -1399,21 +1461,12 @@ public class MewCodeModel implements Model {
         }
 
         toolBlocks.clear();
+        toolBlockIndexes.clear();
     }
 
-    private void savePartialResponse() {
-        if (!streamBuf.isEmpty()) {
-            chatMessages.add(new ChatMessage("assistant", streamBuf.toString()));
-            conversation.addAssistantMessage(streamBuf.toString());
-            SessionManager.saveMessage(System.getProperty("user.dir"), sessionId, "assistant", streamBuf.toString());
-            streamBuf.setLength(0);
-        }
-        commitToolBlocks();
-        chatMessages.add(new ChatMessage("system", "(response interrupted)"));
-        streaming = false;
-        agentQueue = null;
-        userScrolled = false;
-        scrollOffset = 0;
+    private void interruptResponse() {
+        interruptRequested = true;
+        com.mewcode.EventQueue.cancel(agentQueue);
     }
 
     private static String renderToolBlockText(ChatMessage.ToolBlockInfo tb) {
@@ -1581,43 +1634,40 @@ public class MewCodeModel implements Model {
         var result = planApprovalDialog.handleKey(kpm.key());
         if (result == null) return UpdateResult.from(this);
 
-        switch (result.type()) {
-            case YOLO -> {
-                if (permChecker != null) permChecker.setMode(PermissionMode.BYPASS);
-                chatMessages.add(new ChatMessage("system",
-                        "Plan approved. Entered YOLO mode (all operations auto-approved)."));
+        String approvedPlan = planForApproval;
+        planForApproval = null;
+        return switch (result.type()) {
+            case YOLO, MANUAL -> {
+                boolean autoApprove = result.type() == PlanApprovalDialog.Result.YOLO;
+                permChecker.setMode(autoApprove ? PermissionMode.BYPASS : PermissionMode.DEFAULT);
                 PlanFile.resetPlanPath();
-            }
-            case MANUAL -> {
-                if (permChecker != null) {
-                    var restoreMode = prePlanMode != null ? prePlanMode : PermissionMode.DEFAULT;
-                    permChecker.setMode(restoreMode);
-                }
-                chatMessages.add(new ChatMessage("system",
-                        "Plan approved. Each edit will require your confirmation."));
-                PlanFile.resetPlanPath();
+                chatMessages.add(new ChatMessage("system", autoApprove
+                        ? "Plan approved. Entered YOLO mode."
+                        : "Plan approved. Edits require confirmation."));
+                inputBuffer.setLength(0);
+                inputBuffer.append("Implement the approved plan:\n\n").append(approvedPlan);
+                yield sendUserMessage();
             }
             case FEEDBACK -> {
-                String feedback = result.feedback();
                 inputBuffer.setLength(0);
-                inputBuffer.append(feedback);
-                return sendUserMessage();
+                inputBuffer.append(result.feedback());
+                yield sendUserMessage();
             }
-            case CANCEL -> {}
-        }
-        return UpdateResult.from(this);
+            case CANCEL -> UpdateResult.from(this);
+        };
     }
 
     // ────────────────────────────────────────────────────────────────────
     // Task notifications
     // ────────────────────────────────────────────────────────────────────
 
-    private void drainTaskNotifications() {
-        if (subAgentTaskManager == null) return;
-        var notifications = subAgentTaskManager.drainNotifications();
-        for (var n : notifications) {
-            chatMessages.add(new ChatMessage("system",
-                    "Task %s: %s (%s)".formatted(n.taskId(), n.name(), n.status())));
+    private static String toolPathLabel(Object value, String fallback) {
+        if (!(value instanceof String path) || path.isBlank()) return fallback;
+        try {
+            Path name = Path.of(path).getFileName();
+            return name == null ? path : name.toString();
+        } catch (java.nio.file.InvalidPathException e) {
+            return fallback;
         }
     }
 
@@ -1626,18 +1676,18 @@ public class MewCodeModel implements Model {
         return switch (toolName) {
             case "ReadFile" -> {
                 var p = args.get("file_path");
-                yield "Read " + (p != null ? Path.of(p.toString()).getFileName() : toolName);
+                yield "Read " + (toolPathLabel(p, toolName));
             }
             case "WriteFile" -> {
                 var p = args.get("file_path");
                 var content = args.get("content");
-                String name = p != null ? Path.of(p.toString()).getFileName().toString() : "file";
+                String name = toolPathLabel(p, "file");
                 int lines = content instanceof String s ? s.split("\n", -1).length : 0;
                 yield lines > 0 ? "Write %s (%d lines)".formatted(name, lines) : "Write " + name;
             }
             case "EditFile" -> {
                 var p = args.get("file_path");
-                yield "Edit " + (p != null ? Path.of(p.toString()).getFileName() : toolName);
+                yield "Edit " + (toolPathLabel(p, toolName));
             }
             case "Bash" -> {
                 var cmd = args.get("command");
@@ -1669,10 +1719,11 @@ public class MewCodeModel implements Model {
                     // Keep the Agent's session log pointer in sync so a later
                     // compaction writes its boundary into this same file (chained
                     // resume); the fileHistory pointer follows too.
-                    if (agent != null) agent.setSessionId(sessionId);
-                    fileHistory = new com.mewcode.filehistory.FileHistory(
-                            System.getProperty("user.dir"), sessionId);
-                    if (agent != null) agent.setFileHistory(fileHistory);
+                    if (agent != null) {
+                        agent.setSessionId(sessionId);
+                        bindFileHistory(System.getProperty("user.dir"), sessionId);
+                    }
+                    mcpInstructionsOk = false;
 
                     // Compaction-aware rebuild: when the session has a
                     // compact_boundary, the live conversation is the compacted
@@ -1681,22 +1732,32 @@ public class MewCodeModel implements Model {
                     // audit but is not replayed. Without a boundary (old sessions)
                     // everything replays verbatim.
                     conversation = SessionManager.rebuildConversation(messages);
+                    if (agent != null) {
+                        try {
+                            var dir = SessionManager.sessionDataDir(System.getProperty("user.dir"), sessionId);
+                            var records = com.mewcode.toolresult.ReplacementRecordsIO.load(dir);
+                            agent.setReplacementState(com.mewcode.toolresult.ContentReplacementLifecycle.reconstruct(
+                                    conversation.getMessages(), records, null));
+                        } catch (java.io.IOException ignored) {
+                            // The saved conversation retains the original tool result text.
+                        }
+                    }
                     var scan = SessionManager.findLastCompactBoundary(messages);
                     chatMessages.clear();
                     if (scan.found()) {
                         chatMessages.add(new ChatMessage("user", scan.boundary().summary()));
                         for (var k : scan.boundary().keep()) {
-                            chatMessages.add(new ChatMessage(k.role(), k.content()));
+                            if (k.content() != null && !k.content().isBlank()) chatMessages.add(new ChatMessage(k.role(), k.content()));
                         }
                         for (var msg : scan.after()) {
-                            chatMessages.add(new ChatMessage(msg.role(), msg.content()));
+                            if (!msg.content().isBlank() && !msg.isCompactBoundary()) chatMessages.add(new ChatMessage(msg.role(), msg.content()));
                         }
                         chatMessages.add(new ChatMessage("system",
                                 "Resumed session %s from compacted state (summary + %d kept + %d newer messages)"
                                         .formatted(session.id(), scan.boundary().keep().size(), scan.after().size())));
                     } else {
                         for (var msg : messages) {
-                            chatMessages.add(new ChatMessage(msg.role(), msg.content()));
+                            if (!msg.content().isBlank() && !msg.isCompactBoundary()) chatMessages.add(new ChatMessage(msg.role(), msg.content()));
                         }
                         chatMessages.add(new ChatMessage("system",
                                 "Resumed session " + session.id() + " (%d messages)".formatted(messages.size())));

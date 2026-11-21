@@ -46,6 +46,10 @@ public class ToolSearchTool implements Tool {
         this.protocol = protocol;
     }
 
+    public ToolSearchTool forRegistry(ToolRegistry localRegistry) {
+        return new ToolSearchTool(localRegistry, protocol);
+    }
+
     @Override
     public String name() {
         return "ToolSearch";

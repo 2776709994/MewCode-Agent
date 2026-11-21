@@ -6,6 +6,9 @@
 package com.mewcode.agent;
 
 import com.mewcode.config.ProviderConfig;
+import com.mewcode.EventQueue;
+import com.mewcode.session.SessionManager;
+import com.mewcode.worktree.WorktreeSessionStore;
 import com.mewcode.conversation.ConversationManager;
 import com.mewcode.conversation.ThinkingBlock;
 import com.mewcode.conversation.ToolResultBlock;
@@ -24,14 +27,13 @@ import com.mewcode.toolresult.ReplacementRecordsIO;
 import com.mewcode.toolresult.ToolResultBudget;
 
 import java.nio.file.Path;
-import java.nio.file.Paths;
 
 import java.util.*;
 import java.util.concurrent.*;
 
 public class Agent {
 
-    private static final int MAX_TOKENS_CEILING = 64_000;
+    private static final int MAX_RATE_LIMIT_RETRIES = 2;
     private static final int MAX_OUTPUT_RECOVERIES = 3;
 
     private final LlmClient client;
@@ -40,6 +42,7 @@ public class Agent {
     private final int contextWindow;
     private final int maxOutput;
     private PermissionChecker checker;
+    private PermissionMode headlessMode = PermissionMode.DEFAULT;
     private HookEngine hookEngine;
     private int maxIterations;
     private String workDir;
@@ -102,11 +105,27 @@ public class Agent {
         this.maxOutput = cfg.resolvedMaxOutputTokens();
     }
 
+    public void setHeadlessMode(PermissionMode mode) { this.headlessMode = mode; }
+
     public void setChecker(PermissionChecker checker) { this.checker = checker; }
     public void setHookEngine(HookEngine hookEngine) { this.hookEngine = hookEngine; }
     public void setMaxIterations(int max) { this.maxIterations = max; }
     public void setWorkDir(String workDir) { this.workDir = workDir; }
-    public void setSessionId(String sessionId) { this.sessionId = sessionId; }
+
+    public Path effectiveWorkDir() {
+        var worktree = sessionId == null ? null : WorktreeSessionStore.getCurrentSession();
+        String dir = worktree != null ? worktree.worktreePath()
+                : workDir != null ? workDir : System.getProperty("user.dir");
+        return Path.of(dir).toAbsolutePath().normalize();
+    }
+    public void setSessionId(String sessionId) {
+        if (!Objects.equals(this.sessionId, sessionId)) {
+            usageAnchor = null;
+            replacementState = new ContentReplacementState();
+            recoveryState.clear();
+        }
+        this.sessionId = sessionId;
+    }
     public String getSessionId() { return sessionId; }
     public void setNotificationFn(java.util.function.Supplier<List<String>> fn) { this.notificationFn = fn; }
 
@@ -116,28 +135,38 @@ public class Agent {
     public HookEngine getHookEngine() { return hookEngine; }
 
     public BlockingQueue<AgentEvent> run(ConversationManager conv) {
-        var queue = new LinkedBlockingQueue<AgentEvent>(64);
-        Thread.startVirtualThread(() -> {
+        var queue = new EventQueue<AgentEvent>();
+        if (registry.get("AskUserQuestion") instanceof com.mewcode.tool.impl.AskUserTool ask) {
+            ask.setEventQueue(queue);
+        }
+        if (registry.get("Agent") instanceof com.mewcode.subagent.AgentTool agentTool) {
+            agentTool.setParentConversation(conv);
+            agentTool.setParentReplacementState(replacementState);
+        }
+        queue.start(() -> {
+            int turns = 0;
             try {
-                agentLoop(conv, queue);
+                turns = agentLoop(conv, queue);
             } catch (Exception e) {
                 putSafe(queue, new AgentEvent.ErrorEvent("Agent error: " + e.getMessage()));
+            } finally {
+                queue.finish(new AgentEvent.LoopComplete(turns));
             }
         });
         return queue;
     }
 
-    private void agentLoop(ConversationManager conv, BlockingQueue<AgentEvent> queue) {
+    private int agentLoop(ConversationManager conv, BlockingQueue<AgentEvent> queue) {
         conv.injectLongTermMemory(instructions, memoryContent);
+        Path sessionRoot = Path.of(workDir != null ? workDir : System.getProperty("user.dir"));
+        PermissionChecker permissions = checker != null ? checker
+                : new PermissionChecker(headlessMode, effectiveWorkDir());
 
         int totalInput = 0, totalOutput = 0;
         int outputRecoveries = 0;
-        boolean maxTokensEscalated = false;
-
         int contextRetries = 0;
-        boolean loopCompleted = false;
+        int rateLimitRetries = 0;
 
-        try {
         for (int iteration = 1; ; iteration++) {
             if (maxIterations > 0 && iteration > maxIterations) {
                 putSafe(queue, new AgentEvent.ErrorEvent(
@@ -154,6 +183,8 @@ public class Agent {
                 }
             }
 
+            Path executionRoot = effectiveWorkDir();
+
             // Compute the tool schemas once per iteration so the recovery
             // attachment (when compact fires) and the Stream call below see
             // the same set. Skill filters can only change between iterations.
@@ -169,7 +200,7 @@ public class Agent {
 
             // Auto-compact check
             try {
-                String wd = workDir != null ? workDir : System.getProperty("user.dir");
+                String wd = sessionRoot.toString();
                 int sizeBefore = conv.size();
                 String compactMsg = com.mewcode.compact.ContextCompactor.manage(
                         conv, client, contextWindow, maxOutput, wd, sessionId, compactTracking,
@@ -185,27 +216,19 @@ public class Agent {
                 }
             } catch (Exception ignored) {}
 
-            // Inject deferred tool names as system reminder
-            var deferredNames = registry.getDeferredToolNames();
+            var reminders = new ArrayList<String>();
+            var deferredNames = registry.getDeferredToolNames().stream()
+                    .filter(name -> toolNameFilter == null || toolNameFilter.test(name))
+                    .toList();
             if (!deferredNames.isEmpty()) {
-                var sb = new StringBuilder();
-                sb.append("The following deferred tools are available via ToolSearch. ");
-                sb.append("Their schemas are NOT loaded - use ToolSearch with ");
-                sb.append("query \"select:<name>[,<name>...]\" to load tool schemas before calling them:\n");
-                for (var dn : deferredNames) {
-                    sb.append(dn).append("\n");
-                }
-                conv.addSystemReminder(sb.toString());
+                reminders.add("Deferred tools. Use ToolSearch with select:<name>[,<name>...] to load tool schemas before calling them:\n"
+                        + String.join("\n", deferredNames));
             }
 
-            // Plan mode: inject structured workflow reminder
             if (checker != null && checker.getMode() == PermissionMode.PLAN) {
-                String wd = workDir != null ? workDir : System.getProperty("user.dir");
-                String planPath = PlanFile.getOrCreatePlanPath(wd);
+                String planPath = PlanFile.getOrCreatePlanPath(executionRoot.toString());
                 checker.setPlanFilePath(planPath);
-                boolean planExists = PlanFile.planExists();
-                String reminder = PlanModePrompt.buildReminder(planPath, planExists, iteration);
-                conv.addSystemReminder(reminder);
+                reminders.add(PlanModePrompt.buildReminder(planPath, PlanFile.planExists(), iteration));
             }
 
             // Reuse the schema list computed at the top of the iteration so
@@ -214,13 +237,11 @@ public class Agent {
             var tools = iterToolSchemas;
             // Layer 1: apply tool-result budget. Returns a fresh
             // ConversationManager with replacements baked in; `conv` is
-            // never mutated. All writes that happened earlier this iteration
-            // (system reminders, plan-mode reminders, deferred-tool notices)
-            // are reflected in apiConv because Apply rebuilds the manager
-            // from conv.getMessages().
-            Path sessionDir = Paths.get(workDir == null ? "." : workDir, ".mewcode/session");
+            // never mutated. Request-only reminders are attached to the copy.
+            Path sessionDir = sessionId != null ? SessionManager.sessionDataDir(sessionRoot.toString(), sessionId)
+                    : executionRoot.resolve(".mewcode/session");
             ApplyResult applied = ToolResultBudget.apply(conv, sessionDir, replacementState);
-            if (!applied.newRecords().isEmpty()) {
+            if (sessionId != null && !applied.newRecords().isEmpty()) {
                 try {
                     ReplacementRecordsIO.append(sessionDir, applied.newRecords());
                 } catch (Exception ignored) {
@@ -228,6 +249,7 @@ public class Agent {
                     // authoritative for this process lifetime.
                 }
             }
+            reminders.forEach(applied.apiConv()::addSystemReminder);
             var streamQueue = client.stream(applied.apiConv(), tools);
 
             // Consume stream events, collect tool calls
@@ -237,69 +259,70 @@ public class Agent {
             String stopReason = "end_turn";
             int turnInput = 0, turnOutput = 0;
             int turnCacheRead = 0, turnCacheCreation = 0;
-            boolean streamError = false;
+            String streamError = null;
 
-            while (true) {
-                StreamEvent event;
-                try {
-                    event = streamQueue.poll(30, TimeUnit.SECONDS);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return;
+            try {
+                while (true) {
+                    StreamEvent event;
+                    try {
+                        event = streamQueue.poll(30, TimeUnit.SECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return 0;
+                    }
+
+                    if (event == null) {
+                        putSafe(queue, new AgentEvent.ErrorEvent("Stream timeout"));
+                        return 0;
+                    }
+
+                    switch (event) {
+                        case StreamEvent.TextDelta td -> {
+                            text.append(td.text());
+                            putSafe(queue, new AgentEvent.StreamText(td.text()));
+                        }
+                        case StreamEvent.ThinkingDelta td ->
+                                putSafe(queue, new AgentEvent.ThinkingText(td.text()));
+                        case StreamEvent.ThinkingComplete tc -> {
+                            thinkingBlocks.add(new ThinkingBlock(tc.thinking(), tc.signature()));
+                            putSafe(queue, new AgentEvent.ThinkingComplete(tc.thinking(), tc.signature()));
+                        }
+                        case StreamEvent.ToolCallStart tcs ->
+                                putSafe(queue, new AgentEvent.ToolUseEvent(tcs.toolId(), tcs.toolName(), null));
+                        case StreamEvent.ToolCallDelta tcd -> {}
+                        case StreamEvent.ToolCallComplete tcc -> {
+                            toolCalls.add(new ToolCallInfo(tcc.toolId(), tcc.toolName(), tcc.arguments()));
+                            putSafe(queue, new AgentEvent.ToolUseEvent(
+                                    tcc.toolId(), tcc.toolName(), tcc.arguments()));
+                        }
+                        case StreamEvent.StreamEnd se -> {
+                            stopReason = se.stopReason();
+                            turnInput = se.inputTokens();
+                            turnOutput = se.outputTokens();
+                            turnCacheRead = se.cacheReadTokens();
+                            turnCacheCreation = se.cacheCreationTokens();
+                        }
+                        case StreamEvent.Error err -> {
+                            streamError = Objects.toString(err.message(), "Unknown stream error");
+                        }
+                    }
+
+                    if (event instanceof StreamEvent.StreamEnd || event instanceof StreamEvent.Error) break;
                 }
-
-                if (event == null) {
-                    putSafe(queue, new AgentEvent.ErrorEvent("Stream timeout"));
-                    return;
-                }
-
-                switch (event) {
-                    case StreamEvent.TextDelta td -> {
-                        text.append(td.text());
-                        putSafe(queue, new AgentEvent.StreamText(td.text()));
-                    }
-                    case StreamEvent.ThinkingDelta td ->
-                            putSafe(queue, new AgentEvent.ThinkingText(td.text()));
-                    case StreamEvent.ThinkingComplete tc -> {
-                        thinkingBlocks.add(new ThinkingBlock(tc.thinking(), tc.signature()));
-                        putSafe(queue, new AgentEvent.ThinkingComplete(tc.thinking(), tc.signature()));
-                    }
-                    case StreamEvent.ToolCallStart tcs ->
-                            putSafe(queue, new AgentEvent.ToolUseEvent(tcs.toolId(), tcs.toolName(), Map.of()));
-                    case StreamEvent.ToolCallDelta tcd -> {}
-                    case StreamEvent.ToolCallComplete tcc -> {
-                        toolCalls.add(new ToolCallInfo(tcc.toolId(), tcc.toolName(), tcc.arguments()));
-                        putSafe(queue, new AgentEvent.ToolUseEvent(
-                                tcc.toolId(), tcc.toolName(), tcc.arguments()));
-                    }
-                    case StreamEvent.StreamEnd se -> {
-                        stopReason = se.stopReason();
-                        turnInput = se.inputTokens();
-                        turnOutput = se.outputTokens();
-                        turnCacheRead = se.cacheReadTokens();
-                        turnCacheCreation = se.cacheCreationTokens();
-                    }
-                    case StreamEvent.Error err -> {
-                        lastStreamError = err.message();
-                        putSafe(queue, new AgentEvent.ErrorEvent(err.message()));
-                        streamError = true;
-                    }
-                }
-
-                if (event instanceof StreamEvent.StreamEnd || event instanceof StreamEvent.Error) break;
+            } finally {
+                EventQueue.cancel(streamQueue);
             }
 
-            // Error recovery
-            if (streamError) {
-                var lastErr = events_drain_last_error(queue);
-                if (lastErr != null && (lastErr.contains("context") || lastErr.contains("too long")
-                        || lastErr.contains("prompt"))) {
+            if (streamError != null) {
+                String lowerError = streamError.toLowerCase(Locale.ROOT);
+                if (lowerError.contains("context too long") || lowerError.contains("context_length_exceeded")
+                        || lowerError.contains("prompt is too long")) {
                     if (contextRetries < 3) {
                         contextRetries++;
                         putSafe(queue, new AgentEvent.RetryEvent("Context too long, compacting...", 0));
                         int sizeBeforeForce = conv.size();
                         try {
-                            String wdForce = workDir != null ? workDir : System.getProperty("user.dir");
+                            String wdForce = sessionRoot.toString();
                             com.mewcode.compact.ContextCompactor.forceCompact(
                                     conv, client, contextWindow, wdForce, sessionId,
                                     recoveryState, iterToolSchemas);
@@ -313,41 +336,39 @@ public class Agent {
                         continue;
                     }
                 }
-                if (lastErr != null && lastErr.toLowerCase().contains("rate limit")) {
+                if (lowerError.contains("rate limit") && rateLimitRetries++ < MAX_RATE_LIMIT_RETRIES) {
                     putSafe(queue, new AgentEvent.RetryEvent("Rate limited, waiting 5s...", 5000));
-                    try { Thread.sleep(5000); } catch (InterruptedException e) { break; }
+                    try { Thread.sleep(5000); } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
                     continue;
                 }
+                putSafe(queue, new AgentEvent.ErrorEvent(streamError));
                 break;
             }
 
+            contextRetries = 0;
+            rateLimitRetries = 0;
             totalInput += turnInput;
             totalOutput += turnOutput;
             putSafe(queue, new AgentEvent.UsageEvent(totalInput, totalOutput));
 
-            // Max tokens handling
             if ("max_tokens".equals(stopReason)) {
-                if (!maxTokensEscalated) {
-                    maxTokensEscalated = true;
-                    client.setMaxOutputTokens(MAX_TOKENS_CEILING);
-                    if (!text.isEmpty()) {
-                        conv.addAssistantFull(text.toString(), thinkingBlocks, List.of());
-                        conv.addUserMessage("Output token limit hit. Resume directly from where you stopped. Do not apologize or repeat previous content. Pick up mid-thought if needed.");
-                    }
-                    putSafe(queue, new AgentEvent.RetryEvent("max_tokens escalation", 0));
-                    continue;
-                } else if (outputRecoveries < MAX_OUTPUT_RECOVERIES) {
-                    outputRecoveries++;
-                    conv.addAssistantFull(text.toString(), thinkingBlocks, List.of());
-                    conv.addUserMessage("Output token limit hit. Resume directly from where you stopped. Break remaining work into smaller pieces.");
+                if (!text.isEmpty()) {
+                    conv.addAssistantMessage(text.toString());
+                    persistTurn(sessionRoot, text.toString(), List.of(), List.of(), List.of());
+                }
+                if (outputRecoveries++ < MAX_OUTPUT_RECOVERIES) {
+                    conv.addUserMessage("Output token limit hit. Continue from where you stopped and break remaining work into smaller pieces.");
                     putSafe(queue, new AgentEvent.RetryEvent(
                             "max_tokens recovery %d/%d".formatted(outputRecoveries, MAX_OUTPUT_RECOVERIES), 0));
                     continue;
                 }
-                // Exhausted: fall through to normal completion
-            } else {
-                outputRecoveries = 0;
+                putSafe(queue, new AgentEvent.ErrorEvent("Output token limit reached after recovery attempts"));
+                break;
             }
+            outputRecoveries = 0;
 
             // Save assistant message to conversation
             var toolUseBlocks = toolCalls.stream()
@@ -379,13 +400,15 @@ public class Agent {
                 // handler flushes+clears streamBuf without persisting; if we emitted
                 // it first, LoopComplete would see an empty buffer and the final
                 // assistant message would never be saved to the session file.
-                putSafe(queue, new AgentEvent.LoopComplete(iteration));
-                loopCompleted = true;
-                break;
+                persistTurn(sessionRoot, text.toString(), thinkingBlocks, toolUseBlocks, List.of());
+                return iteration;
             }
 
             // Execute tool calls
-            var executor = new StreamingExecutor(registry, checker, hookEngine, queue, recoveryState);
+            var available = tools.stream().map(schema -> (String) schema.get("name"))
+                    .collect(java.util.stream.Collectors.toSet());
+            var executor = new StreamingExecutor(registry, permissions, hookEngine, queue, recoveryState,
+                    executionRoot, checker != null, available);
             var callInfos = toolCalls.stream()
                     .map(tc -> new StreamingExecutor.ToolCallInfo(tc.toolId, tc.toolName, tc.args))
                     .toList();
@@ -397,28 +420,25 @@ public class Agent {
                     .toList();
             conv.addToolResultsMessage(resultBlocks);
 
+            persistTurn(sessionRoot, text.toString(), thinkingBlocks, toolUseBlocks, resultBlocks);
             boolean exitPlanCalled = toolCalls.stream()
-                    .anyMatch(tc -> "ExitPlanMode".equals(tc.toolName));
+                    .filter(tc -> "ExitPlanMode".equals(tc.toolName))
+                    .anyMatch(tc -> results.stream().anyMatch(r -> r.toolId().equals(tc.toolId) && !r.isError()));
             if (exitPlanCalled) {
                 putSafe(queue, new AgentEvent.TurnComplete(iteration));
-                putSafe(queue, new AgentEvent.LoopComplete(iteration));
-                loopCompleted = true;
-                break;
+                return iteration;
             }
 
             putSafe(queue, new AgentEvent.TurnComplete(iteration));
         }
-        } finally {
-            if (!loopCompleted) {
-                putSafe(queue, new AgentEvent.LoopComplete(0));
-            }
-        }
+        return 0;
     }
 
-    private String lastStreamError;
-
-    private String events_drain_last_error(BlockingQueue<AgentEvent> queue) {
-        return lastStreamError;
+    private void persistTurn(Path sessionRoot, String text, List<ThinkingBlock> thinking,
+                             List<ToolUseBlock> toolUses, List<com.mewcode.conversation.ToolResultBlock> results) {
+        if (sessionId != null) {
+            SessionManager.saveTurn(sessionRoot.toString(), sessionId, text, thinking, toolUses, results);
+        }
     }
 
     private static void putSafe(BlockingQueue<AgentEvent> queue, AgentEvent event) {
@@ -430,5 +450,4 @@ public class Agent {
     }
 
     private record ToolCallInfo(String toolId, String toolName, Map<String, Object> args) {}
-    private record ToolCallResult(String toolId, String output, boolean isError) {}
 }

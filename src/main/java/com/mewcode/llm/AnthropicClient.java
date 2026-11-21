@@ -11,12 +11,12 @@ import com.anthropic.core.http.StreamResponse;
 import com.anthropic.models.messages.*;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mewcode.config.ProviderConfig;
+import com.mewcode.EventQueue;
 import com.mewcode.conversation.ConversationManager;
 import com.mewcode.conversation.Message;
 
 import java.util.*;
 import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.LinkedBlockingQueue;
 
 public class AnthropicClient implements LlmClient {
 
@@ -85,9 +85,9 @@ public class AnthropicClient implements LlmClient {
 
     @Override
     public BlockingQueue<StreamEvent> stream(ConversationManager conv, List<Map<String, Object>> tools) {
-        var queue = new LinkedBlockingQueue<StreamEvent>(64);
+        var queue = new EventQueue<StreamEvent>();
 
-        Thread.startVirtualThread(() -> {
+        queue.start(() -> {
             try {
                 doStream(conv, tools, queue);
             } catch (InterruptedException e) {
@@ -147,7 +147,8 @@ public class AnthropicClient implements LlmClient {
         boolean inThinking = false;
         int inputTokens = 0, outputTokens = 0;
         int cacheReadTokens = 0, cacheCreationTokens = 0;
-        String stopReason = "end_turn";
+        String stopReason = null;
+        boolean messageStopped = false;
 
         try (StreamResponse<RawMessageStreamEvent> streamResponse =
                      sdkClient.messages().createStreaming(paramsBuilder.build())) {
@@ -191,20 +192,19 @@ public class AnthropicClient implements LlmClient {
                         inThinking = false;
                     }
                     if (!currentToolName.isEmpty()) {
-                        Map<String, Object> args;
-                        try {
-                            @SuppressWarnings("unchecked")
-                            var parsed = MAPPER.readValue(jsonAccum.toString(), Map.class);
-                            args = parsed;
-                        } catch (Exception e) {
-                            args = new HashMap<>();
-                        }
+                        @SuppressWarnings("unchecked")
+                        Map<String, Object> args = jsonAccum.isEmpty() ? Map.of()
+                                : MAPPER.readValue(jsonAccum.toString(), Map.class);
+                        if (args == null) throw new LlmException("Invalid tool arguments for " + currentToolName);
                         queue.put(new StreamEvent.ToolCallComplete(
                                 currentToolId, currentToolName, args));
                         currentToolName = "";
                         currentToolId = "";
                         jsonAccum.setLength(0);
                     }
+                } else if (event.isMessageStop()) {
+                    messageStopped = true;
+                    break;
                 } else if (event.isMessageDelta()) {
                     var msgDelta = event.asMessageDelta();
                     var sr = msgDelta.delta().stopReason();
@@ -236,6 +236,7 @@ public class AnthropicClient implements LlmClient {
             }
         }
 
+        if (!messageStopped) throw new LlmException.NetworkException("Anthropic stream ended prematurely", null);
         queue.put(new StreamEvent.StreamEnd(
                 stopReason != null ? stopReason : "end_turn", inputTokens, outputTokens,
                 cacheReadTokens, cacheCreationTokens));

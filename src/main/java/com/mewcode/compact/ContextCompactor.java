@@ -16,6 +16,7 @@ import com.mewcode.conversation.ToolUseBlock;
 import com.mewcode.llm.LlmClient;
 import com.mewcode.llm.StreamEvent;
 import com.mewcode.session.SessionManager;
+import com.mewcode.EventQueue;
 
 import java.io.IOException;
 import java.nio.file.FileAlreadyExistsException;
@@ -53,7 +54,7 @@ public final class ContextCompactor {
     // than rely on the soft trigger.
     private static final int MANUAL_COMPACT_SAFETY_MARGIN = 3_000;
 
-    private static final int SINGLE_RESULT_LIMIT = 50_000;
+    private static final int SINGLE_RESULT_LIMIT = 16_000;
     private static final int MESSAGE_AGGREGATE_LIMIT = 200_000;
     private static final int OLD_RESULT_SNIP_CHARS = 2_000;
     private static final int KEEP_RECENT_TURNS = 10;
@@ -457,7 +458,7 @@ public final class ContextCompactor {
         // Degenerate cases: nothing to summarize (everything is in the keep
         // window) or the prefix is too small to be worth a summary round-trip.
         // Fall back to the original behaviour of leaving the conversation as-is.
-        if (keepStartIndex <= 0 || keepStartIndex < MIN_KEEP_MESSAGES) {
+        if (keepStartIndex <= 0) {
             return "";
         }
 
@@ -468,6 +469,7 @@ public final class ContextCompactor {
         String summaryRaw = requestSummary(client,
                 SUMMARY_SYSTEM_PROMPT + "\n\n" + serialized);
         String summaryText = formatCompactSummary(summaryRaw);
+        if (summaryText.isBlank()) return "";
 
         // Persist a compact_boundary record so a later resume can rebuild this
         // compacted state (summary + kept tail) instead of replaying the full
@@ -481,7 +483,7 @@ public final class ContextCompactor {
         if (workDir != null && !workDir.isBlank() && sessionId != null && !sessionId.isBlank()) {
             List<SessionManager.KeepMessage> keepRecords = new ArrayList<>(toKeep.size());
             for (Message m : toKeep) {
-                keepRecords.add(new SessionManager.KeepMessage(m.getRole(), nullSafe(m.getContent())));
+                keepRecords.add(new SessionManager.KeepMessage(m));
             }
             SessionManager.saveCompactBoundary(workDir, sessionId, summaryText, keepRecords);
         }
@@ -622,6 +624,7 @@ public final class ContextCompactor {
     }
 
     private static Path writeSpill(String spillDir, String toolUseId, String content) {
+        if (toolUseId == null || !toolUseId.matches("[A-Za-z0-9_-]+")) return null;
         try {
             Path dir = Path.of(spillDir);
             Files.createDirectories(dir);
@@ -653,18 +656,22 @@ public final class ContextCompactor {
 
         try {
             while (true) {
-                StreamEvent ev = events.take();
+                StreamEvent ev = events.poll(30, java.util.concurrent.TimeUnit.SECONDS);
+                if (ev == null) throw new IllegalStateException("LLM summary timed out");
                 if (ev instanceof StreamEvent.TextDelta td) {
                     summary.append(td.text());
                 } else if (ev instanceof StreamEvent.Error err) {
                     throw new RuntimeException("LLM summary failed: " + err.message());
-                } else if (ev instanceof StreamEvent.StreamEnd) {
+                } else if (ev instanceof StreamEvent.StreamEnd end) {
+                    if ("max_tokens".equals(end.stopReason())) throw new IllegalStateException("LLM summary was truncated");
                     break;
                 }
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new RuntimeException("Summary interrupted", e);
+        } finally {
+            EventQueue.cancel(events);
         }
 
         return summary.toString();

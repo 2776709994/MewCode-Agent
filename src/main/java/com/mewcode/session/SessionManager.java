@@ -8,6 +8,11 @@ package com.mewcode.session;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mewcode.conversation.ConversationManager;
+import com.mewcode.conversation.Message;
+import com.mewcode.conversation.ThinkingBlock;
+import com.mewcode.conversation.ToolUseBlock;
+import com.mewcode.conversation.ToolResultBlock;
+import com.fasterxml.jackson.annotation.JsonInclude;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -35,7 +40,10 @@ public class SessionManager {
      * means {@code content} is a {@link CompactBoundary} JSON blob written by
      * {@link #saveCompactBoundary}.
      */
-    public record SessionMessage(String role, String type, String content, long timestamp) {
+    public record SessionMessage(String role, String type, String content, long timestamp, Turn turn) {
+        public SessionMessage(String role, String type, String content, long timestamp) {
+            this(role, type, content, timestamp, null);
+        }
         /** Convenience constructor for plain (non-boundary) messages. */
         public SessionMessage(String role, String content, long timestamp) {
             this(role, null, content, timestamp);
@@ -46,12 +54,28 @@ public class SessionManager {
         }
     }
 
-    /**
-     * One verbatim message preserved in the recent tail at compaction time. Only
-     * role + content text is stored, matching how the session log already
-     * persists messages (text only, no tool blocks).
-     */
-    public record KeepMessage(String role, String content) {}
+    public record Turn(List<ThinkingBlock> thinking, List<ToolUseBlock> calls, List<ToolResultBlock> results) {}
+
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    public record KeepMessage(String role, String content, List<ThinkingBlock> thinking,
+                              List<ToolUseBlock> calls, List<ToolResultBlock> results) {
+        public KeepMessage(String role, String content) {
+            this(role, content, null, null, null);
+        }
+
+        public KeepMessage(Message message) {
+            this(message.getRole(), message.getContent(), message.getThinkingBlocks(),
+                    message.getToolUses(), message.getToolResults());
+        }
+
+        private Message toMessage() {
+            var message = new Message(role, content == null ? "" : content);
+            message.setThinkingBlocks(thinking);
+            message.setToolUses(calls);
+            message.setToolResults(results);
+            return message;
+        }
+    }
 
     /**
      * Structured payload stored (as JSON) in the content of a boundary record.
@@ -77,13 +101,28 @@ public class SessionManager {
     // ---- ID generation ----
 
     public static String newId() {
-        return LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"));
+        return LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"))
+                + "-" + UUID.randomUUID();
     }
 
     // ---- Persistence ----
 
     public static void saveMessage(String workDir, String sessionId, String role, String content) {
-        saveRecord(workDir, sessionId, role, null, content);
+        saveRecord(workDir, sessionId, role, null, content, null);
+    }
+
+    public static void saveTurn(String workDir, String sessionId, String text, List<ThinkingBlock> thinking,
+                                List<ToolUseBlock> calls, List<ToolResultBlock> results) {
+        saveRecord(workDir, sessionId, "assistant", null, text, new Turn(thinking, calls, results));
+    }
+
+    public static Path sessionDataDir(String workDir, String sessionId) {
+        if (!validId(sessionId)) throw new IllegalArgumentException("Invalid session id");
+        return sessionsDir(workDir).resolve(sessionId);
+    }
+
+    private static boolean validId(String id) {
+        return id != null && id.matches("[A-Za-z0-9_-]+");
     }
 
     /**
@@ -103,15 +142,16 @@ public class SessionManager {
         try {
             String blob = MAPPER.writeValueAsString(
                     new CompactBoundary(summary, keep == null ? List.of() : keep));
-            saveRecord(workDir, sessionId, "system", TYPE_COMPACT_BOUNDARY, blob);
+            saveRecord(workDir, sessionId, "system", TYPE_COMPACT_BOUNDARY, blob, null);
         } catch (JsonProcessingException ignored) {
             // best-effort: a failed boundary just means the next resume replays
             // verbatim, which is still correct (backward-compatible).
         }
     }
 
-    private static void saveRecord(String workDir, String sessionId,
-                                   String role, String type, String content) {
+    private static synchronized void saveRecord(String workDir, String sessionId,
+                                                  String role, String type, String content, Turn turn) {
+        if (workDir == null || !validId(sessionId)) return;
         try {
             Path baseDir = sessionsDir(workDir);
             Files.createDirectories(baseDir);
@@ -125,6 +165,7 @@ public class SessionManager {
             }
             line.put("content", content);
             line.put("ts", Instant.now().getEpochSecond());
+            if (turn != null) line.put("turn", turn);
             String json = MAPPER.writeValueAsString(line) + "\n";
             Files.writeString(file, json, StandardOpenOption.CREATE, StandardOpenOption.APPEND);
         } catch (IOException ignored) {
@@ -133,6 +174,7 @@ public class SessionManager {
     }
 
     public static List<SessionMessage> loadSession(String workDir, String sessionId) {
+        if (!validId(sessionId)) return List.of();
         Path file = sessionsDir(workDir).resolve(sessionId + ".jsonl");
         if (!Files.exists(file)) {
             return List.of();
@@ -143,16 +185,16 @@ public class SessionManager {
             while ((line = reader.readLine()) != null) {
                 if (line.isBlank()) continue;
                 try {
-                    @SuppressWarnings("unchecked")
-                    Map<String, Object> map = MAPPER.readValue(line, Map.class);
-                    String role = (String) map.get("role");
-                    String type = (String) map.get("type");
-                    String content = (String) map.get("content");
-                    long ts = map.get("ts") instanceof Number n ? n.longValue() : 0L;
-                    if (content != null && !content.isEmpty()) {
-                        messages.add(new SessionMessage(role, type, content, ts));
+                    var record = MAPPER.readTree(line);
+                    String role = record.path("role").asText(null);
+                    String type = record.path("type").asText(null);
+                    String content = record.path("content").asText("");
+                    long ts = record.path("ts").asLong();
+                    Turn turn = record.hasNonNull("turn") ? MAPPER.treeToValue(record.get("turn"), Turn.class) : null;
+                    if (role != null && (!content.isEmpty() || turn != null)) {
+                        messages.add(new SessionMessage(role, type, content, ts, turn));
                     }
-                } catch (IOException ignored) {
+                } catch (IOException | RuntimeException ignored) {
                     // skip malformed lines
                 }
             }
@@ -172,30 +214,20 @@ public class SessionManager {
      * old sessions that have no boundary records.
      */
     public static BoundaryScan findLastCompactBoundary(List<SessionMessage> messages) {
-        int last = -1;
-        for (int i = 0; i < messages.size(); i++) {
-            if (messages.get(i).isCompactBoundary()) {
-                last = i;
+        for (int i = messages.size() - 1; i >= 0; i--) {
+            if (!messages.get(i).isCompactBoundary()) continue;
+            try {
+                var boundary = MAPPER.readValue(messages.get(i).content(), CompactBoundary.class);
+                if (boundary == null || boundary.summary() == null || boundary.keep() == null
+                        || boundary.keep().stream().anyMatch(Objects::isNull)) continue;
+                var after = messages.subList(i + 1, messages.size()).stream()
+                        .filter(message -> !message.isCompactBoundary()).toList();
+                return new BoundaryScan(boundary, after, true);
+            } catch (IOException ignored) {
+                // Try the previous valid boundary.
             }
         }
-        if (last < 0) {
-            return new BoundaryScan(null, List.of(), false);
-        }
-        CompactBoundary boundary;
-        try {
-            boundary = MAPPER.readValue(messages.get(last).content(), CompactBoundary.class);
-        } catch (IOException e) {
-            // Corrupt boundary blob — fall back to full replay rather than losing
-            // the conversation.
-            return new BoundaryScan(null, List.of(), false);
-        }
-        List<SessionMessage> after = new ArrayList<>();
-        for (int i = last + 1; i < messages.size(); i++) {
-            SessionMessage m = messages.get(i);
-            if (m.isCompactBoundary()) continue; // defensive; we targeted the final one
-            after.add(m);
-        }
-        return new BoundaryScan(boundary, after, true);
+        return new BoundaryScan(null, List.of(), false);
     }
 
     // ---- Conversation rebuild ----
@@ -212,32 +244,41 @@ public class SessionManager {
         if (!scan.found()) {
             return replay(messages);
         }
-        List<SessionMessage> replay = new ArrayList<>();
-        // Summary becomes the leading user message with the same Chinese framing
-        // as autoCompact, so the model sees a consistent context header on resume.
+        ConversationManager conversation = new ConversationManager();
         String resumeSummary = "本次会话延续自之前的对话，因上下文空间不足进行了压缩。以下是早期对话的摘要：\n\n"
                 + scan.boundary().summary();
         if (!scan.boundary().keep().isEmpty()) {
             resumeSummary += "\n\n近期消息已原样保留。";
         }
-        replay.add(new SessionMessage("user", resumeSummary, 0L));
-        for (KeepMessage k : scan.boundary().keep()) {
-            replay.add(new SessionMessage(k.role(), k.content(), 0L));
+        conversation.addUserMessage(resumeSummary);
+        for (KeepMessage kept : scan.boundary().keep()) {
+            conversation.getMessagesMutable().add(kept.toMessage());
         }
-        replay.addAll(scan.after());
-        return replay(replay);
+        replay(conversation, scan.after());
+        return conversation;
     }
 
     private static ConversationManager replay(List<SessionMessage> messages) {
-        ConversationManager conversation = new ConversationManager();
+        var conversation = new ConversationManager();
+        replay(conversation, messages);
+        return conversation;
+    }
+
+    private static void replay(ConversationManager conversation, List<SessionMessage> messages) {
         for (SessionMessage msg : messages) {
-            if (msg.isCompactBoundary()) continue; // never replay the raw boundary blob
-            switch (msg.role()) {
-                case "assistant" -> conversation.addAssistantMessage(msg.content());
-                default -> conversation.addUserMessage(msg.content());
+            if (msg.isCompactBoundary()) continue;
+            var turn = msg.turn();
+            if (turn != null) {
+                conversation.addAssistantFull(msg.content(), turn.thinking(), turn.calls());
+                if (turn.results() != null && !turn.results().isEmpty()) {
+                    conversation.addToolResultsMessage(turn.results());
+                }
+            } else if ("assistant".equals(msg.role())) {
+                conversation.addAssistantMessage(msg.content());
+            } else {
+                conversation.addUserMessage(msg.content());
             }
         }
-        return conversation;
     }
 
     // ---- Listing ----

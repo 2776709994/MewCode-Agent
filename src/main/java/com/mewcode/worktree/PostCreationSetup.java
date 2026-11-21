@@ -22,7 +22,6 @@ public final class PostCreationSetup {
 
     public static void perform(String repoRoot, String worktreePath, List<String> symlinkDirs) {
         copySettingsLocal(repoRoot, worktreePath);
-        configureHooksPath(repoRoot, worktreePath);
         symlinkDirectories(repoRoot, worktreePath, symlinkDirs);
         copyWorktreeIncludeFiles(repoRoot, worktreePath);
     }
@@ -33,41 +32,20 @@ public final class PostCreationSetup {
         if (!Files.exists(src)) return;
         try {
             Files.createDirectories(dst.getParent());
-            Files.copy(src, dst);
+            if (dst.getParent().toRealPath().startsWith(Path.of(worktreePath).toRealPath())) Files.copy(src, dst);
         } catch (IOException e) {
             log.fine("Failed to copy settings.local.json: " + e.getMessage());
-        }
-    }
-
-    private static void configureHooksPath(String repoRoot, String worktreePath) {
-        String[] candidates = {".husky", ".git/hooks"};
-        String hooksPath = null;
-        for (String c : candidates) {
-            Path p = Path.of(repoRoot, c);
-            if (Files.isDirectory(p)) {
-                hooksPath = p.toString();
-                break;
-            }
-        }
-        if (hooksPath == null) return;
-        try {
-            ProcessBuilder pb = new ProcessBuilder("git", "config", "core.hooksPath", hooksPath);
-            pb.directory(Path.of(worktreePath).toFile());
-            pb.redirectErrorStream(true);
-            Process proc = pb.start();
-            proc.waitFor();
-        } catch (Exception e) {
-            log.fine("Failed to configure hooks path: " + e.getMessage());
         }
     }
 
     private static void symlinkDirectories(String repoRoot, String worktreePath, List<String> dirs) {
         if (dirs == null) return;
         for (String dir : dirs) {
-            if (dir.contains("..")) continue;
-            Path src = Path.of(repoRoot, dir);
-            Path dst = Path.of(worktreePath, dir);
-            if (!Files.exists(src) || Files.exists(dst)) continue;
+            Path relative = Path.of(dir).normalize();
+            if (relative.isAbsolute() || relative.startsWith("..") || relative.toString().isEmpty()) continue;
+            Path src = Path.of(repoRoot).toAbsolutePath().resolve(relative);
+            Path dst = Path.of(worktreePath).toAbsolutePath().resolve(relative);
+            if (!Files.isDirectory(src) || Files.exists(dst)) continue;
             try {
                 Files.createSymbolicLink(dst, src);
             } catch (IOException e) {
@@ -89,19 +67,22 @@ public final class PostCreationSetup {
             ProcessBuilder pb = new ProcessBuilder("git", "ls-files",
                     "--others", "--ignored", "--exclude-standard", "--directory");
             pb.directory(Path.of(repoRoot).toFile());
-            pb.redirectErrorStream(true);
-            Process proc = pb.start();
-            String output = new String(proc.getInputStream().readAllBytes());
-            proc.waitFor();
-            if (proc.exitValue() != 0 || output.isBlank()) return;
+            var result = com.mewcode.ProcessExecution.capture(pb, java.time.Duration.ofSeconds(30));
+            String output = result.output();
+            if (result.exitCode() != 0 || output.isBlank()) return;
 
             for (String entry : output.strip().split("\n")) {
                 if (entry.endsWith("/") || entry.isBlank()) continue;
                 if (matchesAnyPattern(entry, patterns)) {
                     Path src = Path.of(repoRoot, entry);
                     Path dst = Path.of(worktreePath, entry);
-                    Files.createDirectories(dst.getParent());
-                    Files.copy(src, dst);
+                    if (Files.isSymbolicLink(src) || !Files.isRegularFile(src)) continue;
+                    Path worktree = Path.of(worktreePath).toRealPath();
+                    Path parent = dst.getParent();
+                    if (parent != null && (!Files.exists(parent) || parent.toRealPath().startsWith(worktree))) {
+                        Files.createDirectories(parent);
+                        if (parent.toRealPath().startsWith(worktree)) Files.copy(src, dst);
+                    }
                 }
             }
         } catch (Exception e) {

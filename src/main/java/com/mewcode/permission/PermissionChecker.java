@@ -14,9 +14,9 @@ import java.io.IOException;
 import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.PathMatcher;
+import java.nio.file.LinkOption;
+import java.nio.file.NoSuchFileException;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -25,14 +25,16 @@ import java.util.regex.Pattern;
 
 public class PermissionChecker {
 
-    private PermissionMode mode;
+    private volatile PermissionMode mode;
     private final Path projectRoot;
 
-    private final Set<String> allowAlwaysRules = new java.util.HashSet<>();
+    private final Set<Approval> allowAlwaysRules = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    private record Approval(String toolName, String content) {}
 
     /** Parsed permission rules loaded from YAML files (mutable for dynamic append). */
-    private final ArrayList<PermissionRule> fileRules;
-    private String planFilePath;
+    private volatile List<PermissionRule> fileRules;
+    private volatile String planFilePath;
 
     /** A single parsed rule from a permissions.yaml file. */
     private record PermissionRule(String toolName, String pattern, RuleEffect effect) {
@@ -41,9 +43,8 @@ public class PermissionChecker {
                 return false;
             }
             // Use glob matching for the pattern against the content
-            PathMatcher matcher = FileSystems.getDefault().getPathMatcher("glob:" + pattern);
             try {
-                return matcher.matches(Path.of(content));
+                return FileSystems.getDefault().getPathMatcher("glob:" + pattern).matches(Path.of(content));
             } catch (Exception e) {
                 // Fall back to simple wildcard matching if path parsing fails
                 return content.equals(pattern);
@@ -56,21 +57,12 @@ public class PermissionChecker {
     }
 
     private static final Set<String> PLAN_MODE_ALLOWED_TOOLS = Set.of(
-            "Agent", "ToolSearch", "AskUserQuestion", "ExitPlanMode"
+            "ToolSearch", "AskUserQuestion", "ExitPlanMode"
     );
 
     private static final Set<String> SAFE_COMMANDS = Set.of(
-            "ls", "dir", "pwd", "echo", "cat", "head", "tail", "wc",
-            "find", "which", "whereis", "whoami", "hostname", "uname",
-            "date", "cal", "uptime", "df", "du", "free", "env", "printenv",
-            "file", "stat", "readlink", "realpath", "basename", "dirname",
-            "sort", "uniq", "tr", "cut", "awk", "sed", "grep", "egrep", "fgrep",
-            "diff", "comm", "tee", "xargs", "true", "false", "test",
-            "git status", "git log", "git diff", "git show", "git branch",
-            "git tag", "git remote", "git rev-parse", "git ls-files",
-            "git blame", "git stash list", "go version", "go env",
-            "node -v", "npm -v", "npx", "python --version", "pip list",
-            "cargo --version", "rustc --version", "java -version", "java --version"
+            "pwd", "true", "false", "git --version", "java -version", "java --version",
+            "node -v", "python --version", "cargo --version", "rustc --version"
     );
 
     private static final List<Pattern> DANGEROUS_PATTERNS = List.of(
@@ -96,7 +88,7 @@ public class PermissionChecker {
     public PermissionChecker(PermissionMode mode, Path projectRoot) {
         this.mode = mode;
         this.projectRoot = projectRoot;
-        this.fileRules = new ArrayList<>(loadRules());
+        this.fileRules = List.copyOf(loadRules());
     }
 
     public PermissionMode getMode() { return mode; }
@@ -111,25 +103,36 @@ public class PermissionChecker {
     }
 
     public CheckResult check(Tool tool, Map<String, Object> args) {
+        return check(tool, args, projectRoot);
+    }
+
+    public CheckResult check(Tool tool, Map<String, Object> args, Path workDir) {
         String toolName = tool.name();
         String content = extractContent(toolName, args);
 
-        // Layer 0: Plan mode exceptions
-        if (mode == PermissionMode.PLAN) {
-            if (PLAN_MODE_ALLOWED_TOOLS.contains(toolName)) {
-                return CheckResult.allow();
-            }
-            if ("WriteFile".equals(toolName) || "EditFile".equals(toolName)) {
-                String path = stringArg(args, "file_path", "");
-                if (path.contains(".mewcode/plans/")) {
-                    return CheckResult.allow();
-                }
-            }
+        String path = switch (toolName) {
+            case "ReadFile", "WriteFile", "EditFile" -> stringArg(args, "file_path", "");
+            case "Glob", "Grep" -> stringArg(args, "path", ".");
+            default -> null;
+        };
+        if (path != null && !isPathAllowed(workDir, path.isEmpty() ? "." : path)) {
+            return CheckResult.deny("Path outside allowed workspace: " + path);
         }
 
-        // Layer 1: Safe commands (auto-allow)
-        if ("Bash".equals(toolName) && content != null && isSafeCommand(content)) {
-            return CheckResult.allow();
+        PermissionMode currentMode = mode;
+        boolean planWrite = false;
+        if (currentMode == PermissionMode.PLAN) {
+            planWrite = ("WriteFile".equals(toolName) || "EditFile".equals(toolName))
+                    && isActivePlanFile(workDir, path);
+            boolean readOnlyAgent = "Agent".equals(toolName)
+                    && Set.of("plan", "explore").contains(stringArg(args, "subagent_type", ""))
+                    && stringArg(args, "team_name", "").isBlank()
+                    && stringArg(args, "isolation", "").isBlank();
+            if (!planWrite && !readOnlyAgent && !PLAN_MODE_ALLOWED_TOOLS.contains(toolName)
+                    && tool.category() != ToolCategory.READ
+                    && !("Bash".equals(toolName) && isSafeCommand(content))) {
+                return CheckResult.deny("This tool is unavailable in plan mode");
+            }
         }
 
         // Layer 2: Dangerous command detection
@@ -141,17 +144,11 @@ public class PermissionChecker {
             }
         }
 
-        // Layer 3: Path sandbox
-        if (content != null && isPathTool(toolName)) {
-            if (!isPathAllowed(content)) {
-                return CheckResult.deny("Path outside allowed sandbox: " + content);
-            }
-        }
-
         // Layer 4: File-based permission rules (last matching rule wins)
         if (content != null) {
-            for (int i = fileRules.size() - 1; i >= 0; i--) {
-                PermissionRule rule = fileRules.get(i);
+            var rules = fileRules;
+            for (int i = rules.size() - 1; i >= 0; i--) {
+                PermissionRule rule = rules.get(i);
                 if (rule.matches(toolName, content)) {
                     return switch (rule.effect) {
                         case ALLOW -> CheckResult.allow();
@@ -162,12 +159,16 @@ public class PermissionChecker {
         }
 
         // Layer 4b: Allow-always rules (session-level)
-        if (allowAlwaysRules.contains(toolName + ":" + content)) {
+        if (planWrite || currentMode == PermissionMode.PLAN && "Agent".equals(toolName)
+                || "Bash".equals(toolName) && isSafeCommand(content)
+                || allowAlwaysRules.contains(new Approval(toolName, content))) {
             return CheckResult.allow();
         }
 
         // Layer 5: Permission mode matrix
-        var decision = mode.decide(tool.category());
+        if ("SendMessage".equals(toolName) && currentMode != PermissionMode.PLAN) return CheckResult.allow();
+
+        var decision = currentMode.decide(tool.category());
         return switch (decision) {
             case ALLOW -> CheckResult.allow();
             case DENY -> CheckResult.deny("Denied by permission mode: " + mode);
@@ -176,7 +177,7 @@ public class PermissionChecker {
     }
 
     public void addAllowAlwaysRule(String toolName, String content) {
-        allowAlwaysRules.add(toolName + ":" + content);
+        allowAlwaysRules.add(new Approval(toolName, content));
     }
 
     // --- Rule loading from YAML files ---
@@ -212,7 +213,7 @@ public class PermissionChecker {
         return new ArrayList<>(rules);
     }
 
-    public void appendLocalRule(String toolName, String pattern) {
+    public synchronized void appendLocalRule(String toolName, String pattern) {
         if (projectRoot == null) return;
         Path localFile = projectRoot.resolve(".mewcode").resolve("permissions.local.yaml");
         try {
@@ -228,8 +229,7 @@ public class PermissionChecker {
             var yaml = new Yaml();
             Files.writeString(localFile, yaml.dump(entries));
             // Reload
-            fileRules.clear();
-            fileRules.addAll(loadRules());
+            fileRules = List.copyOf(loadRules());
         } catch (IOException ignored) {}
     }
 
@@ -297,31 +297,38 @@ public class PermissionChecker {
     }
 
     private boolean isSafeCommand(String command) {
-        String trimmed = command.trim();
-        if (trimmed.contains("|") || trimmed.contains(";") || trimmed.contains("&&")
-                || trimmed.contains(">") || trimmed.contains("$(") || trimmed.contains("`")) {
+        return command != null && SAFE_COMMANDS.contains(command.strip());
+    }
+
+    private boolean isActivePlanFile(Path workDir, String path) {
+        if (path == null || path.isBlank() || planFilePath == null) return false;
+        try {
+            Path target = workDir.resolve(path).toAbsolutePath().normalize();
+            Path plan = workDir.resolve(planFilePath).toAbsolutePath().normalize();
+            return target.equals(plan) && target.equals(resolveExistingAncestors(target));
+        } catch (IOException | RuntimeException e) {
             return false;
         }
-        for (var safe : SAFE_COMMANDS) {
-            if (trimmed.equals(safe) || trimmed.startsWith(safe + " ")) {
-                return true;
-            }
-        }
-        return false;
     }
 
-    private boolean isPathTool(String toolName) {
-        return "ReadFile".equals(toolName) || "WriteFile".equals(toolName) || "EditFile".equals(toolName);
-    }
-
-    private boolean isPathAllowed(String pathStr) {
+    private boolean isPathAllowed(Path workDir, String path) {
         try {
-            Path p = Path.of(pathStr).toAbsolutePath().normalize();
-            Path root = projectRoot.toAbsolutePath().normalize();
-            Path tmp = Path.of("/tmp").toAbsolutePath().normalize();
-            return p.startsWith(root) || p.startsWith(tmp);
-        } catch (Exception e) {
-            return true;
+            Path root = workDir.toRealPath();
+            Path target = workDir.resolve(path).toAbsolutePath().normalize();
+            return target.startsWith(workDir.toAbsolutePath().normalize())
+                    && resolveExistingAncestors(target).startsWith(root);
+        } catch (IOException | RuntimeException e) {
+            return false;
+        }
+    }
+
+    private static Path resolveExistingAncestors(Path path) throws IOException {
+        try {
+            return path.toRealPath();
+        } catch (NoSuchFileException e) {
+            Path parent = path.getParent();
+            if (parent == null || !Files.notExists(path, LinkOption.NOFOLLOW_LINKS)) throw e;
+            return resolveExistingAncestors(parent).resolve(path.getFileName()).normalize();
         }
     }
 

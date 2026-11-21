@@ -29,8 +29,11 @@ public class TeamManager {
     private final Map<String, Team> teams = new LinkedHashMap<>();
 
     public synchronized Team createTeam(String name, TeamMode mode) {
-        Team team = new Team(name, mode);
-        teams.put(name, team);
+        if (!isValidName(name)) throw new IllegalArgumentException("Invalid team name");
+        String candidate = name;
+        for (int suffix = 2; teams.containsKey(candidate); suffix++) candidate = name + "-" + suffix;
+        Team team = new Team(candidate, mode);
+        teams.put(candidate, team);
         return team;
     }
 
@@ -79,6 +82,10 @@ public class TeamManager {
 
     // ── Inner classes ──────────────────────────────────────────────────
 
+    static boolean isValidName(String name) {
+        return name != null && name.matches("[a-zA-Z0-9_-]{1,100}");
+    }
+
     private static Path teamsBaseDir() {
         return Path.of(System.getProperty("user.dir"), ".mewcode", "teams");
     }
@@ -90,6 +97,7 @@ public class TeamManager {
         private final FileMailBox mailBox;
 
         public Team(String name, TeamMode mode) {
+            if (!isValidName(name)) throw new IllegalArgumentException("Invalid team name");
             this.name = name;
             this.mode = mode;
             this.mailBox = new FileMailBox(teamsBaseDir().resolve(name).resolve("inboxes"));
@@ -102,6 +110,9 @@ public class TeamManager {
 
         public synchronized Member addMember(String name, LlmClient client, ToolRegistry registry,
                                              String protocol, ProviderConfig cfg) {
+            if (!isValidName(name) || members.containsKey(name) || "lead".equals(name)) {
+                throw new IllegalArgumentException("Invalid or duplicate member name: " + name);
+            }
             Agent ag = new Agent(client, registry, protocol, cfg);
             Member member = new Member(name, ag, new ConversationManager());
             members.put(name, member);
@@ -134,6 +145,15 @@ public class TeamManager {
             }
         }
 
+        public synchronized String uniqueMemberName(String description) {
+            String base = description.toLowerCase(java.util.Locale.ROOT).replaceAll("[^a-z0-9_-]+", "-");
+            if (base.length() > 30) base = base.substring(0, 30);
+            if (base.isEmpty() || "lead".equals(base)) base = "worker";
+            String name = base;
+            for (int suffix = 2; members.containsKey(name); suffix++) name = base + "-" + suffix;
+            return name;
+        }
+
         public synchronized Member getMember(String name) {
             return members.get(name);
         }
@@ -146,11 +166,11 @@ public class TeamManager {
             return new ArrayList<>(members.keySet());
         }
 
-        public void sendMessage(String from, String to, String content) {
-            mailBox.send(to, new FileMailBox.MailMessage(from, content));
+        public boolean sendMessage(String from, String to, String content) {
+            return mailBox.send(to, new FileMailBox.MailMessage(from, content));
         }
 
-        public List<TeammateProgress> getTeammateProgressList() {
+        public synchronized List<TeammateProgress> getTeammateProgressList() {
             return members.values().stream()
                     .filter(m -> m.progress != null)
                     .map(m -> m.progress)
@@ -164,7 +184,7 @@ public class TeamManager {
         public final ConversationManager conv;
         public volatile boolean active;
         public volatile Thread thread;
-        public TeammateProgress progress;
+        public volatile TeammateProgress progress;
 
         public Member(String name, Agent agent, ConversationManager conv) {
             this.name = name;

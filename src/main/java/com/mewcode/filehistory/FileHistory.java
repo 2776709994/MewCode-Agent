@@ -14,7 +14,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 
 public class FileHistory {
 
-    public record Backup(String backupPath, int version, Instant time) {}
+    public record Backup(String backupPath, int version, Instant time, boolean absent) {}
 
     public record Snapshot(
             int messageIndex,
@@ -26,6 +26,7 @@ public class FileHistory {
     private static final int MAX_SNAPSHOTS = 100;
 
     private final Path sessionDir;
+    private final String runId = UUID.randomUUID().toString();
     private final Map<String, Integer> trackedFiles = new LinkedHashMap<>();
     private final List<Snapshot> snapshots = new CopyOnWriteArrayList<>();
 
@@ -49,51 +50,42 @@ public class FileHistory {
     }
 
     public synchronized void trackEdit(String path) {
-        Path absPath;
-        try {
-            absPath = Path.of(path).toAbsolutePath();
-        } catch (Exception e) {
-            absPath = Path.of(path);
+        String key = Path.of(path).toAbsolutePath().normalize().toString();
+        if (trackedFiles.containsKey(key)) return;
+
+        trackedFiles.put(key, 0);
+        Backup beforeFirstEdit = capture(key);
+        if (beforeFirstEdit == null) return;
+
+        for (int i = 0; i < snapshots.size(); i++) {
+            Snapshot old = snapshots.get(i);
+            var backups = new LinkedHashMap<>(old.backups());
+            backups.put(key, beforeFirstEdit);
+            snapshots.set(i, new Snapshot(old.messageIndex(), old.userText(), Map.copyOf(backups), old.timestamp()));
         }
-        String key = absPath.toString();
-
-        int ver = trackedFiles.getOrDefault(key, 0);
-        int newVer = ver + 1;
-
-        try {
-            byte[] data = Files.readAllBytes(absPath);
-            Path bp = sessionDir.resolve(backupName(key, newVer));
-            Files.write(bp, data);
-        } catch (IOException ignored) {
-            // File doesn't exist yet (new file) — no backup, but still track
-        }
-
-        trackedFiles.put(key, newVer);
     }
 
     public synchronized void makeSnapshot(int msgIndex, String userText) {
         var backups = new LinkedHashMap<String, Backup>();
-        for (var entry : trackedFiles.entrySet()) {
-            String path = entry.getKey();
-            int ver = entry.getValue();
-            String bpName = backupName(path, ver);
-            Path bp = sessionDir.resolve(bpName);
-
-            // If backup file missing (new file created in this turn), backup current state
-            if (!Files.exists(bp)) {
-                try {
-                    byte[] data = Files.readAllBytes(Path.of(path));
-                    Files.write(bp, data);
-                } catch (IOException ignored) {}
-            }
-
-            backups.put(path, new Backup(bp.toString(), ver, Instant.now()));
+        for (String path : trackedFiles.keySet()) {
+            Backup current = capture(path);
+            if (current != null) backups.put(path, current);
         }
+        snapshots.add(new Snapshot(msgIndex, userText, Map.copyOf(backups), Instant.now()));
+        while (snapshots.size() > MAX_SNAPSHOTS) snapshots.removeFirst();
+    }
 
-        snapshots.add(new Snapshot(msgIndex, userText, backups, Instant.now()));
-
-        while (snapshots.size() > MAX_SNAPSHOTS) {
-            snapshots.removeFirst();
+    private Backup capture(String key) {
+        Path path = Path.of(key);
+        int version = trackedFiles.compute(key, (ignored, last) -> last + 1);
+        if (Files.notExists(path, LinkOption.NOFOLLOW_LINKS)) return new Backup(null, version, Instant.now(), true);
+        try {
+            if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) return null;
+            Path backup = sessionDir.resolve(runId + "-" + backupName(key, version));
+            Files.copy(path, backup);
+            return new Backup(backup.toString(), version, Instant.now(), false);
+        } catch (IOException e) {
+            return null;
         }
     }
 
@@ -118,38 +110,25 @@ public class FileHistory {
             Backup backup = entry.getValue();
 
             try {
-                byte[] backupData = Files.readAllBytes(Path.of(backup.backupPath()));
-                byte[] currentData = new byte[0];
-                try {
-                    currentData = Files.readAllBytes(Path.of(filePath));
-                } catch (IOException ignored) {}
-
-                if (!Arrays.equals(currentData, backupData)) {
-                    Files.createDirectories(Path.of(filePath).getParent());
-                    Files.write(Path.of(filePath), backupData);
+                Path path = Path.of(filePath);
+                if (Files.isSymbolicLink(path)) continue;
+                if (backup.absent()) {
+                    if (Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS) && Files.deleteIfExists(path)) changed.add(filePath);
+                    continue;
+                }
+                Path source = Path.of(backup.backupPath());
+                if (!Files.isRegularFile(source, LinkOption.NOFOLLOW_LINKS)) continue;
+                if (!Files.isRegularFile(path) || Files.mismatch(path, source) != -1) {
+                    Files.createDirectories(path.getParent());
+                    Files.copy(source, path, StandardCopyOption.REPLACE_EXISTING);
                     changed.add(filePath);
                 }
-            } catch (IOException e) {
-                // Backup missing → file didn't exist at that point
-                try {
-                    if (Files.exists(Path.of(filePath))) {
-                        Files.delete(Path.of(filePath));
-                        changed.add(filePath);
-                    }
-                } catch (IOException ignored) {}
+            } catch (IOException ignored) {
+                // An unreadable backup cannot be used to restore or remove a file.
             }
         }
 
-        // Truncate snapshots after target
-        while (snapshots.size() > snapshotIndex + 1) {
-            snapshots.removeLast();
-        }
-
-        // Reset tracked versions
-        for (var entry : target.backups().entrySet()) {
-            trackedFiles.put(entry.getKey(), entry.getValue().version());
-        }
-
+        while (snapshots.size() > snapshotIndex + 1) snapshots.removeLast();
         return changed;
     }
 }

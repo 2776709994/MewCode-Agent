@@ -15,6 +15,11 @@ public enum PermissionMode {
     PLAN,
     BYPASS;
 
+    public static PermissionMode fromConfig(String mode) {
+        if (mode == null || mode.isBlank()) return DEFAULT;
+        return valueOf(mode.strip().replace('-', '_').toUpperCase(java.util.Locale.ROOT));
+    }
+
     public Decision decide(ToolCategory category) {
         return switch (this) {
             case DEFAULT -> switch (category) {
@@ -25,7 +30,7 @@ public enum PermissionMode {
                 case READ, WRITE -> Decision.ALLOW;
                 case COMMAND -> Decision.ASK;
             };
-            case PLAN -> DEFAULT.decide(category);
+            case PLAN -> category == ToolCategory.READ ? Decision.ALLOW : Decision.DENY;
             case BYPASS -> Decision.ALLOW;
         };
     }

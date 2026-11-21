@@ -37,6 +37,13 @@ public final class RecoveryState {
 
     private final Map<String, SkillInvocationRecord> skills = new HashMap<>();
 
+    public void clear() {
+        synchronized (lock) {
+            files.clear();
+            skills.clear();
+        }
+    }
+
     /** Overwrites any prior record for the same path so the latest snapshot wins. */
     public void recordFileRead(String path, String content) {
         if (path == null || path.isEmpty()) return;

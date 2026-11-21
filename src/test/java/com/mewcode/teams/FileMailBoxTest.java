@@ -59,6 +59,16 @@ class FileMailBoxTest {
     }
 
     @Test
+    void drainAcknowledgesMessagesAndLeavesLaterArrivalsUnread() {
+        var box = new FileMailBox(tempDir.resolve("inboxes"));
+        assertTrue(box.send("bob", new FileMailBox.MailMessage("alice", "first")));
+        assertEquals("first", box.drainUnread("bob").getFirst().text());
+        assertTrue(box.send("bob", new FileMailBox.MailMessage("alice", "second")));
+        assertEquals(List.of("second"), box.drainUnread("bob").stream().map(FileMailBox.MailMessage::text).toList());
+        assertTrue(box.drainUnread("bob").isEmpty());
+    }
+
+    @Test
     void nonexistentAgentReturnsEmpty() {
         var mb = new FileMailBox(tempDir.resolve("inboxes"));
         List<FileMailBox.MailMessage> unread = mb.readUnread("nobody");

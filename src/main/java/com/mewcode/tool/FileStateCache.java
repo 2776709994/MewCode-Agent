@@ -53,13 +53,15 @@ public class FileStateCache {
             return "Error: file has not been read yet. Read it first before editing.";
         }
         long currentMtime;
+        String currentContent;
         try {
             currentMtime = Files.getLastModifiedTime(Path.of(absPath)).toMillis();
+            if (Files.size(Path.of(absPath)) > 8 * 1024 * 1024) return "Error: file exceeds 8 MiB";
+            currentContent = Files.readString(Path.of(absPath));
         } catch (IOException e) {
-            // File might have been deleted; let the caller's own exists-check handle it
-            return null;
+            return "Error: file cannot be verified. Read it again before editing.";
         }
-        if (currentMtime > state.mtimeMs()) {
+        if (currentMtime != state.mtimeMs() || !state.content().equals(currentContent)) {
             return "Error: file has been modified since last read. Read it again before editing.";
         }
         return null;

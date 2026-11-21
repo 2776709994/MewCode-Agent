@@ -9,6 +9,8 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
+import java.nio.channels.FileChannel;
+import java.nio.channels.OverlappingFileLockException;
 import java.nio.file.*;
 import java.time.Instant;
 import java.time.format.DateTimeFormatter;
@@ -40,15 +42,16 @@ public class FileMailBox {
     }
 
     private Path inboxPath(String agentId) {
+        if (!TeamManager.isValidName(agentId)) throw new IllegalArgumentException("Invalid recipient name");
         return baseDir.resolve(agentId + ".json");
     }
 
     private Path lockPath(String agentId) {
-        return baseDir.resolve(agentId + ".json.lock");
+        return inboxPath(agentId).resolveSibling(agentId + ".json.lock");
     }
 
-    public void send(String recipient, MailMessage msg) {
-        withLock(recipient, messages -> {
+    public boolean send(String recipient, MailMessage msg) {
+        return withLock(recipient, messages -> {
             var m = new MailMessage(msg.from(), msg.text(), msg.timestamp(), false, msg.color(), msg.summary());
             messages.add(m);
             return messages;
@@ -74,64 +77,77 @@ public class FileMailBox {
         });
     }
 
+    public List<MailMessage> drainUnread(String agentId) {
+        var unread = new ArrayList<MailMessage>();
+        boolean saved = withLock(agentId, messages -> {
+            for (int i = 0; i < messages.size(); i++) {
+                var message = messages.get(i);
+                if (message.read()) continue;
+                unread.add(message);
+                messages.set(i, new MailMessage(message.from(), message.text(), message.timestamp(),
+                        true, message.color(), message.summary()));
+            }
+            return unread.isEmpty() ? null : messages;
+        });
+        return saved ? List.copyOf(unread) : List.of();
+    }
+
     private interface MutationFn {
         List<MailMessage> apply(List<MailMessage> messages);
     }
 
-    private void withLock(String agentId, MutationFn fn) {
+    private boolean withLock(String agentId, MutationFn fn) {
         Path lock = lockPath(agentId);
-        boolean acquired = false;
-
         for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
-            try {
-                Files.createFile(lock);
-                acquired = true;
-                break;
-            } catch (FileAlreadyExistsException e) {
-                // Check for stale lock (>10s old)
-                try {
-                    var modTime = Files.getLastModifiedTime(lock).toInstant();
-                    if (Instant.now().minusSeconds(10).isAfter(modTime)) {
-                        Files.deleteIfExists(lock);
-                    }
-                } catch (IOException ignored) {}
-                int sleepMs = MIN_SLEEP_MS + ThreadLocalRandom.current().nextInt(MAX_SLEEP_MS - MIN_SLEEP_MS);
-                try { Thread.sleep(sleepMs); } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    return;
+            try (var channel = FileChannel.open(lock, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+                 var held = channel.tryLock()) {
+                if (held != null) {
+                    var updated = fn.apply(readInboxFile(agentId));
+                    if (updated != null) writeInbox(agentId, updated);
+                    return true;
                 }
+            } catch (OverlappingFileLockException ignored) {
+                // A thread in this process holds the recipient lock.
             } catch (IOException e) {
-                return;
+                return false;
+            }
+            try {
+                Thread.sleep(ThreadLocalRandom.current().nextInt(MIN_SLEEP_MS, MAX_SLEEP_MS));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
             }
         }
-
-        if (!acquired) return;
-
-        try {
-            List<MailMessage> messages = readInbox(agentId);
-            messages = fn.apply(messages);
-            writeInbox(agentId, messages);
-        } finally {
-            try { Files.deleteIfExists(lock); } catch (IOException ignored) {}
-        }
+        return false;
     }
 
     private List<MailMessage> readInbox(String agentId) {
-        Path path = inboxPath(agentId);
-        if (!Files.exists(path)) return new ArrayList<>();
         try {
-            byte[] data = Files.readAllBytes(path);
-            return MAPPER.readValue(data, new TypeReference<List<MailMessage>>() {});
+            return readInboxFile(agentId);
         } catch (IOException e) {
-            return new ArrayList<>();
+            return List.of();
         }
     }
 
-    private void writeInbox(String agentId, List<MailMessage> messages) {
+    private List<MailMessage> readInboxFile(String agentId) throws IOException {
         Path path = inboxPath(agentId);
+        if (Files.notExists(path)) return new ArrayList<>();
+        if (Files.isSymbolicLink(path)) throw new IOException("Mailbox must be a regular file");
+        var messages = MAPPER.readValue(path.toFile(), new TypeReference<List<MailMessage>>() {});
+        if (messages == null || messages.stream().anyMatch(java.util.Objects::isNull)) {
+            throw new IOException("Invalid mailbox contents");
+        }
+        return messages;
+    }
+
+    private void writeInbox(String agentId, List<MailMessage> messages) throws IOException {
+        Path path = inboxPath(agentId);
+        Path temporary = Files.createTempFile(baseDir, "inbox-", ".tmp");
         try {
-            String json = MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(messages);
-            Files.writeString(path, json);
-        } catch (IOException ignored) {}
+            MAPPER.writerWithDefaultPrettyPrinter().writeValue(temporary.toFile(), messages);
+            Files.move(temporary, path, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        } finally {
+            Files.deleteIfExists(temporary);
+        }
     }
 }

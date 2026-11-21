@@ -11,6 +11,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.mewcode.config.ProviderConfig;
+import com.mewcode.EventQueue;
 import com.mewcode.conversation.ConversationManager;
 import com.mewcode.conversation.Message;
 
@@ -25,7 +26,6 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.LinkedBlockingQueue;
 
 /**
  * LLM client targeting the OpenAI Chat Completions API ({@code /chat/completions}).
@@ -75,9 +75,9 @@ public class OpenAiCompatClient implements LlmClient {
 
     @Override
     public BlockingQueue<StreamEvent> stream(ConversationManager conv, List<Map<String, Object>> tools) {
-        var queue = new LinkedBlockingQueue<StreamEvent>(64);
+        var queue = new EventQueue<StreamEvent>();
 
-        Thread.startVirtualThread(() -> {
+        queue.start(() -> {
             try {
                 doStream(conv, tools, queue);
             } catch (InterruptedException e) {
@@ -124,7 +124,9 @@ public class OpenAiCompatClient implements LlmClient {
         var toolNames = new HashMap<Integer, StringBuilder>();
         var toolArgs = new HashMap<Integer, StringBuilder>();
         var toolIds = new HashMap<Integer, String>();
-        boolean streamEnded = false;
+        String finishReason = null;
+        int[] usage = {0, 0, 0};
+        boolean done = false;
 
         try (var reader = new BufferedReader(
                 new InputStreamReader(response.body(), StandardCharsets.UTF_8))) {
@@ -133,56 +135,42 @@ public class OpenAiCompatClient implements LlmClient {
                 if (line.isEmpty()) continue;       // blank SSE separator
                 if (line.startsWith(":")) continue;  // SSE comment
 
-                if (!line.startsWith("data: ")) continue;
-                String data = line.substring(6).trim();
-
+                if (!line.startsWith("data:")) continue;
+                String data = line.substring(5).strip();
                 if ("[DONE]".equals(data)) {
-                    // Flush any in-flight tool calls then emit StreamEnd if not already done
-                    flushPendingToolCalls(queue, toolNames, toolArgs, toolIds);
-                    if (!streamEnded) {
-                        queue.put(new StreamEvent.StreamEnd("end_turn", 0, 0));
-                    }
+                    done = true;
                     break;
                 }
 
-                streamEnded = handleSseData(data, queue, toolNames, toolArgs, toolIds);
+                JsonNode root = MAPPER.readTree(data);
+                if (root == null || !root.isObject()) throw new IOException("Invalid Chat Completions chunk");
+                if (root.hasNonNull("error")) {
+                    throw new LlmException(root.path("error").path("message").asText("Chat Completions stream failed"));
+                }
+                if (root.hasNonNull("usage")) usage = extractUsage(root);
+                String reason = handleSseData(root, queue, toolNames, toolArgs, toolIds);
+                if (reason != null) finishReason = reason;
             }
         }
+        if (!done && finishReason == null) throw new IOException("Chat Completions stream ended prematurely");
+        if ("content_filter".equals(finishReason)) throw new LlmException("Response blocked by provider content filter");
+        if ("tool_calls".equals(finishReason) || finishReason == null && done) {
+            flushPendingToolCalls(queue, toolNames, toolArgs, toolIds);
+        }
+        String stopReason = "length".equals(finishReason) ? "max_tokens" : "end_turn";
+        queue.put(new StreamEvent.StreamEnd(stopReason, usage[0], usage[1], usage[2], 0));
     }
 
     // ------------------------------------------------------------------
     // SSE chunk handling
     // ------------------------------------------------------------------
 
-    /**
-     * Process a single SSE data payload.
-     *
-     * @return true if a StreamEnd event was emitted (i.e. finish_reason seen)
-     */
-    private boolean handleSseData(String data, BlockingQueue<StreamEvent> queue,
-                                   Map<Integer, StringBuilder> toolNames,
-                                   Map<Integer, StringBuilder> toolArgs,
-                                   Map<Integer, String> toolIds) throws InterruptedException {
-        JsonNode root;
-        try {
-            root = MAPPER.readTree(data);
-        } catch (JsonProcessingException e) {
-            return false; // skip unparsable chunks
-        }
-
-        // ---- error object ----
-        if (root.has("error")) {
-            var errNode = root.get("error");
-            String errMsg = errNode.has("message") ? errNode.get("message").asText() : errNode.toString();
-            queue.put(new StreamEvent.Error(errMsg));
-            return false;
-        }
-
+    private String handleSseData(JsonNode root, BlockingQueue<StreamEvent> queue,
+                                 Map<Integer, StringBuilder> toolNames,
+                                 Map<Integer, StringBuilder> toolArgs,
+                                 Map<Integer, String> toolIds) throws InterruptedException {
         JsonNode choices = root.path("choices");
-        if (!choices.isArray() || choices.isEmpty()) {
-            // Might be a usage-only chunk (stream_options.include_usage)
-            return emitUsageIfPresent(root, queue);
-        }
+        if (!choices.isArray() || choices.isEmpty()) return null;
 
         JsonNode choice = choices.get(0);
         JsonNode delta = choice.path("delta");
@@ -222,21 +210,7 @@ public class OpenAiCompatClient implements LlmClient {
         }
 
         // ---- finish_reason ----
-        String finishReason = choice.has("finish_reason") && !choice.get("finish_reason").isNull()
-                ? choice.get("finish_reason").asText() : null;
-
-        if ("tool_calls".equals(finishReason)) {
-            flushPendingToolCalls(queue, toolNames, toolArgs, toolIds);
-            // Don't emit StreamEnd yet — the agent loop will continue after tool execution
-            return false;
-        } else if ("stop".equals(finishReason) || "length".equals(finishReason)) {
-            String stopReason = "length".equals(finishReason) ? "max_tokens" : "end_turn";
-            int[] usage = extractUsage(root);
-            queue.put(new StreamEvent.StreamEnd(stopReason, usage[0], usage[1], usage[2], 0));
-            return true;
-        }
-
-        return false;
+        return choice.path("finish_reason").asText(null);
     }
 
     // ------------------------------------------------------------------
@@ -246,7 +220,7 @@ public class OpenAiCompatClient implements LlmClient {
     private void flushPendingToolCalls(BlockingQueue<StreamEvent> queue,
                                        Map<Integer, StringBuilder> toolNames,
                                        Map<Integer, StringBuilder> toolArgs,
-                                       Map<Integer, String> toolIds) throws InterruptedException {
+                                       Map<Integer, String> toolIds) throws InterruptedException, IOException {
         if (toolNames.isEmpty()) return;
 
         var sorted = new ArrayList<>(toolNames.keySet());
@@ -257,14 +231,9 @@ public class OpenAiCompatClient implements LlmClient {
             String callId = toolIds.getOrDefault(idx, "call_" + idx);
             String rawArgs = toolArgs.containsKey(idx) ? toolArgs.get(idx).toString() : "{}";
 
-            Map<String, Object> args;
-            try {
-                @SuppressWarnings("unchecked")
-                var parsed = MAPPER.readValue(rawArgs, Map.class);
-                args = parsed;
-            } catch (Exception e) {
-                args = Map.of();
-            }
+            @SuppressWarnings("unchecked")
+            Map<String, Object> args = MAPPER.readValue(rawArgs, Map.class);
+            if (args == null) throw new IOException("Invalid tool arguments for " + name);
             queue.put(new StreamEvent.ToolCallComplete(callId, name, args));
         }
 
@@ -276,15 +245,6 @@ public class OpenAiCompatClient implements LlmClient {
     // ------------------------------------------------------------------
     // Usage extraction
     // ------------------------------------------------------------------
-
-    private boolean emitUsageIfPresent(JsonNode root, BlockingQueue<StreamEvent> queue) throws InterruptedException {
-        int[] usage = extractUsage(root);
-        if (usage[0] > 0 || usage[1] > 0) {
-            queue.put(new StreamEvent.StreamEnd("end_turn", usage[0], usage[1], usage[2], 0));
-            return true;
-        }
-        return false;
-    }
 
     /**
      * Returns {input, output, cacheRead}. OpenAI-compatible providers have no

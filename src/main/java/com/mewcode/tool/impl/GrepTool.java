@@ -110,7 +110,8 @@ public class GrepTool implements Tool {
 
                 @Override
                 public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
-                    if (includeMatcher != null && !includeMatcher.matches(file.getFileName())) {
+                    if (!attrs.isRegularFile() || Files.isSymbolicLink(file)
+                            || includeMatcher != null && !includeMatcher.matches(file.getFileName())) {
                         return FileVisitResult.CONTINUE;
                     }
                     files.add(file);

@@ -69,8 +69,8 @@ public final class StaleCleanup {
                     continue;
                 }
 
-                // Layer 3: fail-closed change checks (-uno skips untracked)
-                String statusOut = runGitQuiet(wtPath, "--no-optional-locks", "status", "--porcelain", "-uno");
+                // Layer 3: fail-closed change checks (including untracked files)
+                String statusOut = runGitQuiet(wtPath, "--no-optional-locks", "status", "--porcelain");
                 if (statusOut == null || !statusOut.isBlank()) continue;
 
                 String unpushedOut = runGitQuiet(wtPath, "rev-list", "--max-count=1", "HEAD", "--not", "--remotes");
@@ -123,15 +123,11 @@ public final class StaleCleanup {
             pb.directory(Path.of(cwd).toFile());
             pb.environment().put("GIT_TERMINAL_PROMPT", "0");
             pb.environment().put("GIT_ASKPASS", "");
-            pb.redirectErrorStream(false);
-            Process proc = pb.start();
-            String stdout = new String(proc.getInputStream().readAllBytes());
-            boolean finished = proc.waitFor(30, TimeUnit.SECONDS);
-            if (!finished) {
-                proc.destroyForcibly();
-                return null;
-            }
-            return proc.exitValue() == 0 ? stdout : null;
+            var result = com.mewcode.ProcessExecution.capture(pb, java.time.Duration.ofSeconds(30));
+            return result.exitCode() == 0 ? result.output() : null;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return null;
         } catch (Exception e) {
             return null;
         }

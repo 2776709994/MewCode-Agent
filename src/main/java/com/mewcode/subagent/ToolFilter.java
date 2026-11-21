@@ -15,7 +15,6 @@ import java.util.Set;
  * Filters a {@link ToolRegistry} to produce a restricted registry suitable
  * for a sub-agent. The filtering layers (applied in order) are:
  * <ul>
- *   <li>Layer 1: MCP tools (prefixed with "mcp__") always pass through.</li>
  *   <li>Layer 2: {@code ALWAYS_DISALLOWED} — globally blocked tools
  *       (TaskOutput, ExitPlanMode, EnterPlanMode, Agent, AskUserQuestion,
  *       TaskStop, Workflow).</li>
@@ -92,12 +91,6 @@ public final class ToolFilter {
         for (Tool tool : source.listTools()) {
             String name = tool.name();
 
-            // Layer 1: MCP tools always pass through
-            if (isMcpTool(name)) {
-                filtered.register(tool);
-                continue;
-            }
-
             // Layer 2: Globally blocked tools
             if (ALWAYS_DISALLOWED.contains(name)) {
                 continue;
@@ -110,7 +103,7 @@ public final class ToolFilter {
 
             // Layer 4: In async mode, only permit the allow-listed tools
             if (isAsync) {
-                boolean asyncAllowed = ASYNC_ALLOWED.contains(name);
+                boolean asyncAllowed = ASYNC_ALLOWED.contains(name) || name.startsWith("mcp__");
                 if (!asyncAllowed) {
                     // In-process teammates get extra tools even in async mode
                     if (isInProcessTeammate
@@ -132,12 +125,10 @@ public final class ToolFilter {
                 continue;
             }
 
-            filtered.register(tool);
+            filtered.register("ToolSearch".equals(name) && tool instanceof com.mewcode.tool.impl.ToolSearchTool search
+                    ? search.forRegistry(filtered) : tool);
         }
         return filtered;
     }
 
-    private static boolean isMcpTool(String name) {
-        return name.startsWith("mcp__");
-    }
 }
